@@ -10,7 +10,9 @@ import { Server as SocketIOServer } from "socket.io";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
-const productionDist = path.join(projectRoot, "dist");
+const productionDist = process.env.RIFT_DIST_DIR
+  ? path.resolve(process.env.RIFT_DIST_DIR)
+  : path.join(projectRoot, "dist");
 
 const PORT = readPositiveInteger(process.env.PORT, 3001);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -26,6 +28,8 @@ const MAX_DECK_SIZE = readPositiveInteger(process.env.MAX_DECK_SIZE, 200);
 const MAX_LOG_ENTRIES = 100;
 const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const ZONES = new Set(["deck", "hand", "board", "discard", "banished"]);
+const serverId = crypto.randomUUID();
+const NOOP_ACK = () => {};
 
 /** @type {Map<string, ReturnType<typeof createRoomRecord>>} */
 const rooms = new Map();
@@ -39,7 +43,10 @@ app.use((request, response, next) => {
     .map((origin) => origin.trim())
     .filter(Boolean);
   const requestOrigin = request.headers.origin;
-  if (!configuredOrigins?.length || configuredOrigins.includes(requestOrigin)) {
+  if (
+    (configuredOrigins?.length && configuredOrigins.includes(requestOrigin))
+    || (!configuredOrigins?.length && isAllowedLanOrigin(requestOrigin))
+  ) {
     response.setHeader("Access-Control-Allow-Origin", requestOrigin || "*");
   }
   response.setHeader("Vary", "Origin");
@@ -67,6 +74,41 @@ app.get("/api/health", (_request, response) => {
     connectedPlayers,
     uptimeSeconds: Math.floor(process.uptime()),
     now: new Date().toISOString(),
+  });
+});
+
+app.get("/api/network-info", (request, response) => {
+  const listeningPort = Number(httpServer.address()?.port) || PORT;
+  const requestedClientPort = Number(request.query.clientPort);
+  const clientPort = Number.isInteger(requestedClientPort) && requestedClientPort > 0 && requestedClientPort < 65536
+    ? requestedClientPort
+    : listeningPort;
+  response.json({
+    ok: true,
+    serverId,
+    port: listeningPort,
+    urls: getLanAddresses().map((address) => `http://${address}:${clientPort}`),
+  });
+});
+
+app.get("/api/rooms/:code", (request, response) => {
+  const code = String(request.params.code || "").trim().toUpperCase();
+  const room = rooms.get(code);
+  if (!room) {
+    response.status(404).json({
+      ok: false,
+      error: "Room not found on this host. Open the host's full invite link, or ask the host to create a new room.",
+      serverId,
+    });
+    return;
+  }
+  response.json({
+    ok: true,
+    serverId,
+    code,
+    status: room.status,
+    seats: room.players.size,
+    full: room.players.size >= 2,
   });
 });
 
@@ -98,6 +140,7 @@ const io = new SocketIOServer(httpServer, {
   maxHttpBufferSize: 256_000,
   pingInterval: 10_000,
   pingTimeout: 20_000,
+  allowRequest: (request, callback) => callback(null, isAllowedLanOrigin(request.headers.origin)),
 });
 
 io.on("connection", (socket) => {
@@ -576,6 +619,7 @@ function markPlayerDisconnected(room, player) {
   broadcastState(room, "room:player-disconnected");
 
   clearTimeout(player.disconnectTimer);
+  const disconnectGrace = room.status === "lobby" ? EMPTY_ROOM_TTL_MS : RECONNECT_GRACE_MS;
   player.disconnectTimer = setTimeout(() => {
     if (player.connected || !room.players.has(player.id)) return;
     if (room.status === "lobby") {
@@ -593,7 +637,7 @@ function markPlayerDisconnected(room, player) {
       touchRoom(room, `${player.name} did not reconnect in time.`);
       broadcastState(room, "game:disconnect-forfeit");
     }
-  }, RECONNECT_GRACE_MS);
+  }, disconnectGrace);
   player.disconnectTimer.unref?.();
 }
 
@@ -842,7 +886,7 @@ function readPositiveInteger(rawValue, fallback) {
 }
 
 function normaliseAck(rawAck) {
-  return typeof rawAck === "function" ? rawAck : () => {};
+  return typeof rawAck === "function" ? rawAck : NOOP_ACK;
 }
 
 function protocolError(code, message) {
@@ -861,7 +905,7 @@ function sendOperationError(socket, ack, error) {
   };
   if (!error?.code) console.error(error);
   ack(payload);
-  socket.emit("server:error", payload.error);
+  if (ack === NOOP_ACK) socket.emit("server:error", payload.error);
 }
 
 const roomSweeper = setInterval(() => {
@@ -878,12 +922,43 @@ const roomSweeper = setInterval(() => {
 }, Math.min(60_000, EMPTY_ROOM_TTL_MS));
 roomSweeper.unref?.();
 
-httpServer.listen(PORT, HOST, () => {
-  console.log(`Riftbound LAN server listening on port ${PORT}`);
-  for (const address of getLanAddresses()) {
-    console.log(`  http://${address}:${PORT}`);
+async function startLanServer({ port = PORT, host = HOST, quiet = false } = {}) {
+  if (!httpServer.listening) {
+    await new Promise((resolve, reject) => {
+      const onError = (error) => reject(error);
+      httpServer.once("error", onError);
+      httpServer.listen(port, host, () => {
+        httpServer.off("error", onError);
+        resolve();
+      });
+    });
   }
-});
+  const listeningPort = Number(httpServer.address()?.port) || port;
+  const urls = getLanAddresses().map((address) => `http://${address}:${listeningPort}`);
+  if (!quiet) {
+    console.log(`Riftbound LAN server listening on port ${listeningPort}`);
+    for (const url of urls) console.log(`  ${url}`);
+  }
+  return { port: listeningPort, urls, serverId };
+}
+
+async function stopLanServer() {
+  clearInterval(roomSweeper);
+  for (const room of rooms.values()) {
+    for (const player of room.players.values()) clearTimeout(player.disconnectTimer);
+  }
+  if (!httpServer.listening) return;
+  io.emit("server:shutdown", { message: "The local host is shutting down." });
+  await new Promise((resolve) => io.close(resolve));
+}
+
+function getServerStatus() {
+  return {
+    serverId,
+    rooms: rooms.size,
+    activeGames: [...rooms.values()].filter((room) => room.status === "playing").length,
+  };
+}
 
 function getLanAddresses() {
   const addresses = new Set(["localhost"]);
@@ -895,4 +970,33 @@ function getLanAddresses() {
   return [...addresses];
 }
 
-export { app, httpServer, io };
+function isAllowedLanOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "localhost" || hostname === "[::1]" || hostname === "::1") return true;
+    const parts = hostname.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+    return parts[0] === 10
+      || parts[0] === 127
+      || (parts[0] === 192 && parts[1] === 168)
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 169 && parts[1] === 254);
+  } catch {
+    return false;
+  }
+}
+
+const isDirectRun = process.argv[1]
+  && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+
+if (isDirectRun) {
+  startLanServer().catch((error) => {
+    console.error("Could not start Riftbound LAN server:", error);
+    process.exitCode = 1;
+  });
+}
+
+export { app, getLanAddresses, getServerStatus, httpServer, io, startLanServer, stopLanServer };

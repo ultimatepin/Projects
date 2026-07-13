@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { createElement, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft,
   BookOpen,
@@ -6,17 +6,16 @@ import {
   ChevronDown,
   CircleHelp,
   Copy,
-  Gamepad2,
   Globe2,
   Grid2X2,
   Layers3,
   Library,
   Menu,
   Minus,
-  MoreHorizontal,
   Plus,
   Radio,
   Search,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Swords,
@@ -27,7 +26,10 @@ import {
   Zap,
 } from 'lucide-react'
 import { io } from 'socket.io-client'
+import HelpModal from './components/HelpModal'
+import UpdatesView from './components/UpdatesView'
 import { fallbackCards } from './data/fallbackCards'
+import { copyText, parseInvite, readStorage, removeStorage, writeStorage } from './lib/browser'
 import { cardImage, cardSearchText, deckCount, deckEntries, DOMAIN_COLORS, SET_NAMES, titleCase, zoneCount } from './lib/cards'
 import { createDeck, loadDecks, saveDecks } from './lib/storage'
 
@@ -35,6 +37,7 @@ const NAV = [
   { id: 'discover', label: 'Discover', icon: Grid2X2 },
   { id: 'decks', label: 'My decks', icon: Layers3 },
   { id: 'play', label: 'Play local', icon: Swords },
+  { id: 'updates', label: 'Updates', icon: Settings2 },
 ]
 
 const FILTER_TYPES = ['All', 'Unit', 'Spell', 'Gear', 'Battlefield', 'Legend', 'Rune']
@@ -81,21 +84,21 @@ function Brand({ compact = false }) {
   )
 }
 
-function Sidebar({ page, onPage }) {
+function Sidebar({ page, onPage, onHelp }) {
   return (
     <aside className="sidebar">
       <Brand />
       <nav className="primary-nav" aria-label="Main navigation">
         <span className="nav-eyebrow">Library</span>
-        {NAV.slice(0, 2).map(({ id, label, icon: Icon }) => (
-          <button key={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
-            <Icon size={18} strokeWidth={1.8} />{label}
+        {NAV.slice(0, 2).map(({ id, label, icon }) => (
+          <button key={id} data-page={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
+            {createElement(icon, { size: 18, strokeWidth: 1.8 })}{label}
           </button>
         ))}
         <span className="nav-eyebrow nav-eyebrow--spaced">Tabletop</span>
-        {NAV.slice(2).map(({ id, label, icon: Icon }) => (
-          <button key={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
-            <Icon size={18} strokeWidth={1.8} />{label}<i className="live-dot" />
+        {NAV.slice(2).map(({ id, label, icon }) => (
+          <button key={id} data-page={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
+            {createElement(icon, { size: 18, strokeWidth: 1.8 })}{label}{id === 'play' && <i className="live-dot" />}
           </button>
         ))}
       </nav>
@@ -105,10 +108,9 @@ function Sidebar({ page, onPage }) {
         <ShieldCheck size={16} className="verified" />
       </div>
       <div className="sidebar-footer">
-        <button><CircleHelp size={17} /> How to play</button>
+        <button onClick={onHelp}><CircleHelp size={17} /> How to play</button>
         <div className="profile-dot">P1</div>
         <div><strong>Player one</strong><span>Ready to play</span></div>
-        <MoreHorizontal size={17} />
       </div>
     </aside>
   )
@@ -117,26 +119,44 @@ function Sidebar({ page, onPage }) {
 function MobileNav({ page, onPage }) {
   return (
     <nav className="mobile-nav" aria-label="Mobile navigation">
-      {NAV.map(({ id, label, icon: Icon }) => (
-        <button key={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
-          <Icon size={20} /><span>{label.replace('My ', '').replace(' local', '')}</span>
+      {NAV.map(({ id, label, icon }) => (
+        <button key={id} data-page={id} className={page === id ? 'active' : ''} onClick={() => onPage(id)}>
+          {createElement(icon, { size: 20 })}<span>{label.replace('My ', '').replace(' local', '')}</span>
         </button>
       ))}
     </nav>
   )
 }
 
-function Topbar({ title, kicker, onMenu }) {
+function Topbar({ title, kicker, onMenu, onHelp }) {
   return (
     <header className="topbar">
       <button className="mobile-menu" onClick={onMenu} aria-label="Open menu"><Menu /></button>
       <div><span>{kicker}</span><strong>{title}</strong></div>
       <div className="topbar-actions">
         <span className="connection-pill"><i /> Server online</span>
-        <button className="icon-btn" aria-label="Help"><CircleHelp size={19} /></button>
+        <button className="icon-btn" onClick={onHelp} aria-label="Help"><CircleHelp size={19} /></button>
       </div>
     </header>
   )
+}
+
+function MobileDrawer({ open, page, onPage, onHelp, onClose }) {
+  if (!open) return null
+  return (
+    <div className="mobile-drawer-backdrop" onMouseDown={onClose}>
+      <aside className="mobile-drawer" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="mobile-drawer-head"><Brand /><button onClick={onClose} aria-label="Close menu"><X /></button></div>
+        <nav>{NAV.map(({ id, label, icon }) => <button key={id} data-page={id} className={page === id ? 'active' : ''} onClick={() => { onPage(id); onClose() }}>{createElement(icon, { size: 18 })}{label}</button>)}</nav>
+        <button className="drawer-help" onClick={() => { onClose(); onHelp() }}><CircleHelp size={18} /> How to play</button>
+      </aside>
+    </div>
+  )
+}
+
+function Toast({ toast, onClose }) {
+  if (!toast) return null
+  return <button className={`app-toast ${toast.tone || ''}`} onClick={onClose}><span>{toast.tone === 'error' ? '!' : <Check size={14} />}</span>{toast.message}<X size={13} /></button>
 }
 
 function CardArtwork({ card, eager = false }) {
@@ -272,8 +292,8 @@ function CardGridSkeleton() {
   return <div className="card-grid">{Array.from({ length: 18 }).map((_, index) => <div className="card-skeleton" key={index}><span /><i /></div>)}</div>
 }
 
-function EmptyState({ icon: Icon, title, copy, action }) {
-  return <div className="empty-state"><span><Icon /></span><h3>{title}</h3><p>{copy}</p>{action}</div>
+function EmptyState({ icon, title, copy, action }) {
+  return <div className="empty-state"><span>{createElement(icon)}</span><h3>{title}</h3><p>{copy}</p>{action}</div>
 }
 
 function zoneForCard(card) {
@@ -287,7 +307,7 @@ function expandedMainDeck(deck) {
   return Object.entries(deck?.cards || {}).flatMap(([cardId, count]) => Array.from({ length: count }, () => cardId))
 }
 
-function DecksView({ cards, decks, setDecks }) {
+function DecksView({ cards, decks, setDecks, onToast }) {
   const [activeId, setActiveId] = useState(decks[0]?.id || null)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('All')
@@ -323,7 +343,17 @@ function DecksView({ cards, decks, setDecks }) {
     const cap = zone === 'cards' ? 3 : zone === 'battlefields' ? 1 : 12
     const totalCap = zone === 'battlefields' ? 3 : zone === 'runes' ? 12 : Infinity
     const sameNameCount = Object.entries(currentZone).reduce((total, [id, count]) => total + (cardsById[id]?.name === card.name ? count : 0), 0)
-    if (currentCount >= cap || zoneTotal >= totalCap || (zone === 'cards' && sameNameCount >= 3) || (zone === 'battlefields' && sameNameCount >= 1)) return
+    if (zone === 'cards' && zoneTotal >= 40) {
+      onToast?.('The main deck already has 40 cards.', 'error')
+      return
+    }
+    if (currentCount >= cap || zoneTotal >= totalCap || (zone === 'cards' && sameNameCount >= 3) || (zone === 'battlefields' && sameNameCount >= 1)) {
+      const message = zone === 'runes' ? 'The rune deck already has 12 cards.'
+        : zone === 'battlefields' ? 'Choose three battlefields with unique names.'
+          : 'A main deck can contain at most three cards with the same name.'
+      onToast?.(message, 'error')
+      return
+    }
     updateDeck({ [zone]: { ...currentZone, [card.id]: currentCount + 1 } })
   }
 
@@ -423,7 +453,7 @@ function DecksView({ cards, decks, setDecks }) {
             ))}
             {!Object.keys(deckZone).length && <div className="zone-empty"><BookOpen size={22} /><span>No cards here yet</span><small>Add {deckTab === 'cards' ? 'units, spells, and gear' : deckTab} from the catalog.</small></div>}
           </div>
-          <div className="deck-panel-footer"><span><i className={complete ? 'done' : ''}>{complete ? <Check size={12} /> : '!'}</i>{complete ? 'Deck complete' : 'Finish deck requirements'}</span><button onClick={() => navigator.clipboard?.writeText(JSON.stringify(deck))}><Copy size={15} /> Copy list</button></div>
+          <div className="deck-panel-footer"><span><i className={complete ? 'done' : ''}>{complete ? <Check size={12} /> : '!'}</i>{complete ? 'Deck complete' : 'Finish deck requirements'}</span><button onClick={async () => { try { await copyText(JSON.stringify(deck, null, 2)); onToast?.('Deck list copied.') } catch { onToast?.('Could not copy. Select and copy the deck manually.', 'error') } }}><Copy size={15} /> Copy list</button></div>
         </aside>
       </div>
       <CardModal card={selectedCard} onClose={() => setSelectedCard(null)} onAdd={addCard} count={selectedCard ? allDeckCounts[selectedCard.id] || 0 : 0} />
@@ -436,43 +466,64 @@ function ProgressRing({ value, target, label }) {
   return <div className="progress-item"><span className="progress-ring" style={{ '--progress': `${progress * 3.6}deg` }}><b>{value}</b><i>/{target}</i></span><small>{label}</small></div>
 }
 
-function PlayView({ decks, cards }) {
-  const [name, setName] = useState(localStorage.getItem('rift-local-player') || '')
-  const [roomCode, setRoomCode] = useState('')
+function PlayView({ decks, cards, onToast }) {
+  const inviteFromUrl = useMemo(() => parseInvite(window.location.href), [])
+  const savedSession = useMemo(() => {
+    try { return JSON.parse(readStorage(sessionStorage, 'rift-local-session', 'null')) } catch { return null }
+  }, [])
+  const [name, setName] = useState(() => readStorage(localStorage, 'rift-local-player', ''))
+  const [roomCode, setRoomCode] = useState(inviteFromUrl?.code || '')
   const [selectedDeck, setSelectedDeck] = useState(decks[0]?.id || '')
+  const [serverOrigin, setServerOrigin] = useState(inviteFromUrl?.origin || savedSession?.serverOrigin || window.location.origin)
+  const [networkUrls, setNetworkUrls] = useState([])
   const [room, setRoom] = useState(null)
   const [selfId, setSelfId] = useState(null)
   const [error, setError] = useState('')
   const [connected, setConnected] = useState(false)
+  const [pending, setPending] = useState('')
   const socketRef = useRef(null)
 
   useEffect(() => {
-    const socket = io({ transports: ['websocket', 'polling'] })
+    setConnected(false)
+    const target = serverOrigin === window.location.origin ? undefined : serverOrigin
+    const socket = io(target, { transports: ['websocket', 'polling'], reconnectionDelayMax: 3000 })
     socketRef.current = socket
     socket.on('connect', () => {
       setConnected(true)
-      try {
-        const saved = JSON.parse(sessionStorage.getItem('rift-local-session') || 'null')
-        if (saved?.roomCode && saved?.playerId && saved?.reconnectToken) {
-          socket.emit('room:reconnect', saved, (response) => {
-            if (response?.ok) {
-              setSelfId(response.playerId)
-              setRoom({ ...response.state, selfId: response.playerId })
-            } else {
-              sessionStorage.removeItem('rift-local-session')
-            }
-          })
-        }
-      } catch { sessionStorage.removeItem('rift-local-session') }
+      let saved = null
+      try { saved = JSON.parse(readStorage(sessionStorage, 'rift-local-session', 'null')) } catch { saved = null }
+      if (saved?.roomCode && saved?.playerId && saved?.reconnectToken && (!saved.serverOrigin || saved.serverOrigin === serverOrigin)) {
+        socket.timeout(5000).emit('room:reconnect', saved, (timeoutError, response) => {
+          if (!timeoutError && response?.ok) {
+            setSelfId(response.playerId)
+            setRoom({ ...response.state, selfId: response.playerId })
+          } else {
+            removeStorage(sessionStorage, 'rift-local-session')
+          }
+        })
+      }
     })
     socket.on('disconnect', () => setConnected(false))
     socket.on('room:state', (payload) => setRoom((current) => ({ ...payload.state, selfId: current?.selfId })))
     socket.on('server:error', (payload) => setError(payload?.message || 'The local server rejected that action'))
+    socket.on('server:shutdown', (payload) => setError(payload?.message || 'The host app closed.'))
     return () => socket.disconnect()
-  }, [])
+  }, [serverOrigin])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let port = ''
+    try { port = new URL(serverOrigin).port } catch { port = '' }
+    fetch(`${serverOrigin}/api/network-info?clientPort=${port || 80}`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload) => setNetworkUrls(payload.urls || []))
+      .catch(() => setNetworkUrls([]))
+    return () => controller.abort()
+  }, [serverOrigin])
 
   const cardsById = useMemo(() => Object.fromEntries(cards.map((card) => [card.id, card])), [cards])
   const chosen = decks.find((deck) => deck.id === selectedDeck)
+  const canJoin = connected && roomCode.length === 6 && !pending
 
   function quickDeck() {
     return cards.filter((card) => !['Legend', 'Rune', 'Battlefield'].includes(card.type) && !card.variant).slice(0, 40).map((card) => card.id)
@@ -480,91 +531,146 @@ function PlayView({ decks, cards }) {
 
   function playerPayload() {
     const cleanName = name.trim() || 'Player'
-    localStorage.setItem('rift-local-player', cleanName)
+    writeStorage(localStorage, 'rift-local-player', cleanName)
     const selectedCards = expandedMainDeck(chosen)
     return { playerName: cleanName, deck: selectedCards.length ? selectedCards : quickDeck() }
   }
 
+  function friendlyError(response, fallback) {
+    if (response?.error?.code === 'ROOM_NOT_FOUND') return 'Room not found on this host. Paste the full invite link from the host, not only a code from another app copy.'
+    return response?.error?.message || fallback
+  }
+
   function acceptSession(response) {
     if (!response?.ok) {
-      setError(response?.error?.message || 'Could not open that room')
-      return
+      setError(friendlyError(response, 'Could not open that room.'))
+      return false
     }
-    const session = { roomCode: response.roomCode, playerId: response.playerId, reconnectToken: response.reconnectToken }
-    sessionStorage.setItem('rift-local-session', JSON.stringify(session))
+    const session = { roomCode: response.roomCode, playerId: response.playerId, reconnectToken: response.reconnectToken, serverOrigin }
+    writeStorage(sessionStorage, 'rift-local-session', JSON.stringify(session))
     setSelfId(response.playerId)
     setRoom({ ...response.state, selfId: response.playerId })
+    return true
+  }
+
+  function requestRoom(event, payload, label) {
+    if (!socketRef.current?.connected || pending) return
+    setPending(label)
+    setError('')
+    removeStorage(sessionStorage, 'rift-local-session')
+    socketRef.current.timeout(7000).emit(event, payload, (timeoutError, response) => {
+      setPending('')
+      if (timeoutError) {
+        setError('The host did not answer. Check the invite address, Wi-Fi, and Private-network firewall permission.')
+        return
+      }
+      acceptSession(response)
+    })
   }
 
   function createRoom() {
-    setError('')
-    socketRef.current?.emit('room:create', playerPayload(), (response) => {
-      acceptSession(response)
-    })
+    requestRoom('room:create', playerPayload(), 'create')
   }
 
   function joinRoom() {
-    setError('')
-    socketRef.current?.emit('room:join', { ...playerPayload(), roomCode: roomCode.trim().toUpperCase() }, (response) => {
-      acceptSession(response)
-    })
+    if (!canJoin) return
+    requestRoom('room:join', { ...playerPayload(), roomCode }, 'join')
+  }
+
+  function changeJoinValue(value) {
+    const invite = parseInvite(value)
+    if (invite) {
+      setRoomCode(invite.code)
+      setError('')
+      if (invite.origin !== serverOrigin) {
+        removeStorage(sessionStorage, 'rift-local-session')
+        setRoom(null)
+        setSelfId(null)
+        setServerOrigin(invite.origin)
+      }
+      return
+    }
+    setRoomCode(value.replace(/[^a-z0-9]/gi, '').slice(0, 6).toUpperCase())
   }
 
   function leaveRoom() {
     socketRef.current?.emit('room:leave', {})
-    sessionStorage.removeItem('rift-local-session')
+    removeStorage(sessionStorage, 'rift-local-session')
     setSelfId(null)
     setRoom(null)
+    setError('')
   }
 
   if (room?.status === 'playing' || room?.status === 'finished') {
-    return <GameBoard room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} cardsById={cardsById} onLeave={leaveRoom} />
+    return <GameBoard room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} cardsById={cardsById} connected={connected} error={error} onClearError={() => setError('')} onLeave={leaveRoom} />
   }
 
   if (room) {
-    return <RoomLobby room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} connected={connected} onLeave={leaveRoom} />
+    return <RoomLobby room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} connected={connected} networkUrls={networkUrls} serverOrigin={serverOrigin} error={error} onError={setError} onClearError={() => setError('')} onToast={onToast} onLeave={leaveRoom} />
   }
 
   return (
     <div className="play-page">
       <section className="play-intro">
-        <span className="eyebrow"><Radio size={14} /> Same Wi‑Fi · Two devices</span>
+        <span className="eyebrow"><Radio size={14} /> Same Wi-Fi · Two devices</span>
         <h1>Your table.<br /><em>No cloud required.</em></h1>
-        <p>One device creates a private room. The other joins with a six-character code. Every move stays on your local network.</p>
+        <p>One device hosts the room. Device two opens that host’s full invite link, so both players reach the same table instead of two separate local servers.</p>
         <div className="connection-steps">
-          <div><span>01</span><strong>Host the app</strong><small>Run it on one computer</small></div>
+          <div><span>01</span><strong>Host the app</strong><small>Run the Windows package once</small></div>
           <i />
-          <div><span>02</span><strong>Share the address</strong><small>Open it on device two</small></div>
+          <div><span>02</span><strong>Share the invite</strong><small>Send the full Wi-Fi address</small></div>
           <i />
-          <div><span>03</span><strong>Enter the code</strong><small>Meet at the same table</small></div>
+          <div><span>03</span><strong>Join the same host</strong><small>Paste the link or enter its code</small></div>
         </div>
-        <div className="local-callout"><ShieldCheck /><div><strong>Private local session</strong><span>Cards and game state never leave your network.</span></div></div>
+        <div className="local-callout"><ShieldCheck /><div><strong>Private local session</strong><span>Decks and game state never leave your network.</span></div></div>
       </section>
 
       <section className="room-card">
         <div className="room-card-head"><span className="room-icon"><Swords /></span><div><span className="eyebrow">Local duel</span><h2>Enter the arena</h2></div><span className={`server-badge ${connected ? '' : 'offline'}`}><i />{connected ? 'Server ready' : 'Connecting'}</span></div>
+        <div className="target-host"><Globe2 size={15} /><span><small>Connected host</small><strong>{serverOrigin.replace(/^https?:\/\//, '')}</strong></span></div>
         <label className="field-label">Player name<input value={name} onChange={(event) => setName(event.target.value)} maxLength={24} placeholder="What should we call you?" /></label>
         <label className="field-label">Battle deck<select value={selectedDeck} onChange={(event) => setSelectedDeck(event.target.value)}><option value="">Quick demo deck · 40 cards</option>{decks.map((deck) => <option key={deck.id} value={deck.id}>{deck.name} · {deckCount(deck)}/40</option>)}</select></label>
-        <button className="primary-btn wide host-btn" onClick={createRoom} disabled={!connected}><Wifi size={18} /> Create private room</button>
+        <button className="primary-btn wide host-btn" onClick={createRoom} disabled={!connected || Boolean(pending)}><Wifi size={18} /> {pending === 'create' ? 'Creating room…' : 'Create private room'}</button>
         <div className="or-divider"><span>or join a friend</span></div>
-        <div className="join-row"><input value={roomCode} onChange={(event) => setRoomCode(event.target.value.replace(/[^a-z0-9]/gi, '').slice(0, 6).toUpperCase())} onKeyDown={(event) => event.key === 'Enter' && joinRoom()} placeholder="ROOM CODE" /><button className="outline-btn" onClick={joinRoom} disabled={roomCode.length < 4}>Join room</button></div>
+        <div className="join-row"><input value={roomCode} onChange={(event) => changeJoinValue(event.target.value)} onPaste={(event) => { const text = event.clipboardData.getData('text'); if (parseInvite(text)) { event.preventDefault(); changeJoinValue(text) } }} onKeyDown={(event) => event.key === 'Enter' && canJoin && joinRoom()} placeholder="CODE OR INVITE LINK" /><button className="outline-btn" onClick={joinRoom} disabled={!canJoin}>{pending === 'join' ? 'Joining…' : 'Join room'}</button></div>
+        <p className="join-hint">If each device opened its own app, paste the host’s full invite link here.</p>
         {error && <p className="form-error">{error}</p>}
-        <p className="room-footnote"><Globe2 size={14} /> Both devices must be connected to the same Wi‑Fi.</p>
+        <p className="room-footnote"><Globe2 size={14} /> Both devices must be connected to the same Private Wi-Fi.</p>
       </section>
     </div>
   )
 }
 
-function RoomLobby({ room, socket, connected, onLeave }) {
+function RoomLobby({ room, socket, connected, networkUrls, serverOrigin, error, onError, onClearError, onToast, onLeave }) {
   const [copied, setCopied] = useState(false)
+  const [pending, setPending] = useState('')
   const players = room.players || []
   const self = players.find((player) => player.id === room.selfId)
   const everyoneReady = players.length === 2 && players.every((player) => player.ready)
   const isHost = room.hostPlayerId === room.selfId
-  function copyCode() {
-    navigator.clipboard?.writeText(room.code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+  const shareBase = networkUrls.find((url) => !url.includes('localhost') && !url.includes('127.0.0.1')) || serverOrigin
+  const inviteUrl = `${shareBase.replace(/\/$/, '')}/?join=${room.code}`
+
+  async function copy(value, label) {
+    try {
+      await copyText(value)
+      setCopied(label)
+      onToast?.(`${label} copied.`)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      onToast?.('Copy is blocked. Select the invite address and copy it manually.', 'error')
+    }
+  }
+
+  function lobbyAction(event, payload = {}) {
+    if (!connected || pending) return
+    setPending(event)
+    onClearError()
+    socket.timeout(6000).emit(event, payload, (timeoutError, response) => {
+      setPending('')
+      if (timeoutError) onError('The host did not answer. Check the Wi-Fi connection.')
+      else if (!response?.ok) onError(response?.error?.message || 'That action could not be completed.')
+    })
   }
   return (
     <div className="waiting-room">
@@ -572,8 +678,11 @@ function RoomLobby({ room, socket, connected, onLeave }) {
       <div className="waiting-orb"><Radio /></div>
       <span className="eyebrow">Private local room</span>
       <h1>{players.length < 2 ? 'Waiting for your rival' : 'Both players are here'}</h1>
-      <p>{players.length < 2 ? 'Open this app on the second device and enter the code below.' : 'Lock in when you are ready to begin the duel.'}</p>
-      <button className="room-code" onClick={copyCode}><span>{room.code}</span><small>{copied ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy code</>}</small></button>
+      <p>{players.length < 2 ? 'Open the full invite below on device two. The code alone cannot cross between two independently hosted app copies.' : 'Lock in when you are ready to begin the duel.'}</p>
+      <div className="invite-panel">
+        <button className="room-code" onClick={() => copy(room.code, 'Code')}><span>{room.code}</span><small>{copied === 'Code' ? <><Check size={14} /> Copied</> : <><Copy size={14} /> Copy code</>}</small></button>
+        <div className="invite-link"><span><Globe2 size={14} /><strong>{inviteUrl}</strong></span><button onClick={() => copy(inviteUrl, 'Invite link')}>{copied === 'Invite link' ? <Check size={15} /> : <Copy size={15} />} {copied === 'Invite link' ? 'Copied' : 'Copy full invite'}</button></div>
+      </div>
       <div className="versus-row">
         {[0, 1].map((index) => {
           const player = players[index]
@@ -582,16 +691,17 @@ function RoomLobby({ room, socket, connected, onLeave }) {
         <i>VS</i>
       </div>
       {everyoneReady && isHost ? (
-        <button className="primary-btn ready-btn" disabled={!connected} onClick={() => socket?.emit('game:start', {})}><Swords size={18} /> Start the duel</button>
+        <div className="lobby-action-row"><button className="outline-btn" disabled={!connected || Boolean(pending)} onClick={() => lobbyAction('game:ready', { ready: false })}>Cancel ready</button><button className="primary-btn ready-btn" disabled={!connected || Boolean(pending)} onClick={() => lobbyAction('game:start')}><Swords size={18} /> {pending === 'game:start' ? 'Starting…' : 'Start the duel'}</button></div>
       ) : (
-        <button className="primary-btn ready-btn" disabled={!connected || players.length < 2} onClick={() => socket?.emit('game:ready', { ready: !self?.ready })}><Swords size={18} /> {self?.ready ? 'Ready — tap to cancel' : players.length < 2 ? 'Waiting for player two' : 'Lock in & play'}</button>
+        <button className="primary-btn ready-btn" disabled={!connected || players.length < 2 || Boolean(pending)} onClick={() => lobbyAction('game:ready', { ready: !self?.ready })}><Swords size={18} /> {self?.ready ? 'Ready — tap to cancel' : players.length < 2 ? 'Waiting for player two' : pending ? 'Saving…' : 'Lock in & play'}</button>
       )}
+      {error && <button className="play-error-banner" onClick={onClearError}><span>!</span>{error}<X size={13} /></button>}
       <span className="pulse-copy"><i /> {connected ? 'Connected to local host' : 'Reconnecting…'}</span>
     </div>
   )
 }
 
-function GameBoard({ room, socket, cardsById, onLeave }) {
+function GameBoard({ room, socket, cardsById, connected, error, onClearError, onLeave }) {
   const game = room
   const self = game.players?.find((player) => player.id === room.selfId) || {}
   const opponent = game.players?.find((player) => player.id !== room.selfId) || {}
@@ -600,8 +710,10 @@ function GameBoard({ room, socket, cardsById, onLeave }) {
   const ownBoard = self.zones?.board?.cards || []
   const opposingBoard = opponent.zones?.board?.cards || []
   const selectedBoardCard = ownBoard.find((card) => card.instanceId === selected)
+  const canAct = connected && game.status === 'playing'
 
   function action(type, payload = {}) {
+    if (!canAct) return
     socket?.emit('game:action', { type, payload })
   }
 
@@ -622,9 +734,10 @@ function GameBoard({ room, socket, cardsById, onLeave }) {
         </div>
         <Zone label="Your base" cards={fieldCards(ownBoard, -1)} cardsById={cardsById} selected={selected} onSelect={(instance) => setSelected(instance.instanceId)} compact />
       </section>
-      <section className="player-strip"><PlayerBadge player={self} self /><div className="resource-counters"><ScoreControl value={self.counters?.energy || 0} label="Energy" onChange={(delta) => action('SET_COUNTER', { key: 'energy', value: (self.counters?.energy || 0) + delta })} /><ScoreControl value={self.score || 0} label="Score" onChange={(delta) => action('ADJUST_SCORE', { delta })} /></div><div className="deck-pile"><button onClick={() => action('DRAW')}><span /><b>{self.zones?.deck?.count ?? 0}</b><small>Draw</small></button></div></section>
-      {selectedBoardCard && <div className="card-action-bar"><span>Move selected card</span><button onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: -1 })}>Base</button>{[0, 1, 2].map((field) => <button key={field} onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: field })}>Field {field + 1}</button>)}<button onClick={() => action('SET_CARD_STATE', { instanceId: selected, exhausted: !selectedBoardCard.exhausted })}>{selectedBoardCard.exhausted ? 'Ready' : 'Exhaust'}</button><button className="danger" onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'board', to: 'discard' }); setSelected(null) }}>Discard</button><button className="close-action" onClick={() => setSelected(null)}><X size={14} /></button></div>}
-      <section className="hand-zone"><div className="hand-label">Your hand <span>{hand.length}</span><small>{self.zones?.discard?.count || 0} discarded</small></div><div className="hand-cards">{hand.map((instance) => { const card = cardsById[instance.cardId]; return card ? <button key={instance.instanceId} className={selected === instance.instanceId ? 'selected' : ''} onClick={() => setSelected(instance.instanceId)}><CardArtwork card={card} /></button> : null })}</div><div className="turn-actions"><button className="outline-btn" disabled={!hand.some((card) => card.instanceId === selected)} onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'hand', to: 'board' }); setSelected(null) }}>Play to base</button><button className="primary-btn" disabled={game.turnPlayerId !== room.selfId || game.status !== 'playing'} onClick={() => action('END_TURN')}>End turn <ArrowLeft className="arrow-right" size={16} /></button></div></section>
+      <section className="player-strip"><PlayerBadge player={self} self /><div className="resource-counters"><ScoreControl value={self.counters?.energy || 0} label="Energy" disabled={!canAct} onChange={(delta) => action('SET_COUNTER', { key: 'energy', value: (self.counters?.energy || 0) + delta })} /><ScoreControl value={self.score || 0} label="Score" disabled={!canAct} onChange={(delta) => action('ADJUST_SCORE', { delta })} /></div><div className="deck-pile"><button disabled={!canAct || !self.zones?.deck?.count} onClick={() => action('DRAW')}><span /><b>{self.zones?.deck?.count ?? 0}</b><small>Draw</small></button></div></section>
+      {selectedBoardCard && <div className="card-action-bar"><span>Move selected card</span><button disabled={!canAct || (selectedBoardCard.counters?.field ?? -1) === -1} onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: -1 })}>Base</button>{[0, 1, 2].map((field) => <button key={field} disabled={!canAct || selectedBoardCard.counters?.field === field} onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: field })}>Field {field + 1}</button>)}<button disabled={!canAct} onClick={() => action('SET_CARD_STATE', { instanceId: selected, exhausted: !selectedBoardCard.exhausted })}>{selectedBoardCard.exhausted ? 'Ready' : 'Exhaust'}</button><button disabled={!canAct} className="danger" onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'board', to: 'discard' }); setSelected(null) }}>Discard</button><button className="close-action" onClick={() => setSelected(null)}><X size={14} /></button></div>}
+      {error && <button className="play-error-banner game-error" onClick={onClearError}><span>!</span>{error}<X size={13} /></button>}
+      <section className="hand-zone"><div className="hand-label">Your hand <span>{hand.length}</span><small>{self.zones?.discard?.count || 0} discarded</small></div><div className="hand-cards">{hand.map((instance) => { const card = cardsById[instance.cardId]; return card ? <button key={instance.instanceId} className={selected === instance.instanceId ? 'selected' : ''} onClick={() => setSelected(instance.instanceId)}><CardArtwork card={card} /></button> : null })}</div><div className="turn-actions"><button className="outline-btn" disabled={!canAct || !hand.some((card) => card.instanceId === selected)} onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'hand', to: 'board' }); setSelected(null) }}>Play to base</button><button className="primary-btn" disabled={!canAct || game.turnPlayerId !== room.selfId} onClick={() => action('END_TURN')}>End turn <ArrowLeft className="arrow-right" size={16} /></button></div></section>
     </div>
   )
 }
@@ -633,18 +746,31 @@ function PlayerBadge({ player, self }) {
   return <div className="player-badge"><span>{player?.name?.slice(0, 2).toUpperCase() || 'P?'}</span><div><small>{self ? 'You' : 'Opponent'}</small><strong>{player?.name || 'Player'}</strong></div></div>
 }
 
-function ScoreControl({ value, label, onChange, readOnly = false }) {
-  return <div className="score-control"><small>{label}</small><span>{!readOnly && <button onClick={() => onChange(-1)}><Minus size={12} /></button>}<b>{value}</b>{!readOnly && <button onClick={() => onChange(1)}><Plus size={12} /></button>}</span></div>
+function ScoreControl({ value, label, onChange, readOnly = false, disabled = false }) {
+  return <div className="score-control"><small>{label}</small><span>{!readOnly && <button disabled={disabled} onClick={() => onChange(-1)}><Minus size={12} /></button>}<b>{value}</b>{!readOnly && <button disabled={disabled} onClick={() => onChange(1)}><Plus size={12} /></button>}</span></div>
 }
 
 function Zone({ label, cards = [], cardsById, compact, landscape, selected, onSelect }) {
-  return <div className={`play-zone ${compact ? 'compact' : ''} ${landscape ? 'landscape' : ''}`}><small>{label}</small><div>{cards.length ? cards.map((item, index) => { const card = typeof item === 'string' ? cardsById[item] : cardsById[item.cardId]; return card ? <button key={item.instanceId || `${card.id}-${index}`} className={`${selected === item.instanceId ? 'selected' : ''} ${item.exhausted ? 'exhausted' : ''}`} onClick={() => onSelect?.(item)}><CardArtwork card={card} /></button> : <span className="face-down-card" key={item.instanceId || index} /> }) : <em>Drop zone</em>}</div></div>
+  return <div className={`play-zone ${compact ? 'compact' : ''} ${landscape ? 'landscape' : ''}`}><small>{label}</small><div>{cards.length ? cards.map((item, index) => { const card = typeof item === 'string' ? cardsById[item] : cardsById[item.cardId]; if (!card) return <span className="face-down-card" key={item.instanceId || index} />; const className = `${selected === item.instanceId ? 'selected' : ''} ${item.exhausted ? 'exhausted' : ''}`; return onSelect ? <button key={item.instanceId || `${card.id}-${index}`} className={className} onClick={() => onSelect(item)}><CardArtwork card={card} /></button> : <span key={item.instanceId || `${card.id}-${index}`} className={`public-card ${className}`}><CardArtwork card={card} /></span> }) : <em>Drop zone</em>}</div></div>
 }
 
 export default function App() {
-  const [page, setPage] = useState('discover')
+  const [page, setPage] = useState(() => new URLSearchParams(window.location.search).has('join') ? 'play' : 'discover')
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [toast, setToast] = useState(null)
   const { cards, loading } = useCards()
   const [decks, setDecksState] = useState(() => loadDecks().map(normalizeDeck))
+
+  useEffect(() => {
+    if (!toast) return undefined
+    const timeout = setTimeout(() => setToast(null), 3200)
+    return () => clearTimeout(timeout)
+  }, [toast])
+
+  function showToast(message, tone = 'success') {
+    setToast({ message, tone, id: Date.now() })
+  }
 
   function setDecks(update) {
     setDecksState((current) => {
@@ -658,20 +784,25 @@ export default function App() {
     discover: ['Card archive', 'All cards'],
     decks: ['Workshop', 'My decks'],
     play: ['Local tabletop', 'Play 1v1'],
+    updates: ['Desktop app', 'Updates'],
   }[page]
 
   return (
     <div className={`app-shell page-${page}`}>
-      <Sidebar page={page} onPage={setPage} />
+      <Sidebar page={page} onPage={setPage} onHelp={() => setHelpOpen(true)} />
       <main className="main-content">
-        <Topbar kicker={pageMeta[0]} title={pageMeta[1]} />
+        <Topbar kicker={pageMeta[0]} title={pageMeta[1]} onMenu={() => setMobileMenuOpen(true)} onHelp={() => setHelpOpen(true)} />
         <div className={`page-content ${page === 'decks' ? 'page-content--wide' : ''}`}>
           {page === 'discover' && <DiscoverView cards={cards} loading={loading} onBuild={() => setPage('decks')} />}
-          {page === 'decks' && <DecksView cards={cards} decks={decks} setDecks={setDecks} />}
-          {page === 'play' && <PlayView decks={decks} cards={cards} />}
+          {page === 'decks' && <DecksView cards={cards} decks={decks} setDecks={setDecks} onToast={showToast} />}
+          {page === 'play' && <PlayView decks={decks} cards={cards} onToast={showToast} />}
+          {page === 'updates' && <UpdatesView onToast={showToast} />}
         </div>
       </main>
       <MobileNav page={page} onPage={setPage} />
+      <MobileDrawer open={mobileMenuOpen} page={page} onPage={setPage} onHelp={() => setHelpOpen(true)} onClose={() => setMobileMenuOpen(false)} />
+      {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
+      <Toast toast={toast} onClose={() => setToast(null)} />
     </div>
   )
 }
