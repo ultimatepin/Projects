@@ -6,7 +6,7 @@ A local-first Riftbound companion with an English card browser, deck builder, pr
 
 Run the one-click installer:
 
-[`release/Rift-Local-Setup-1.0.0-x64.exe`](release/Rift-Local-Setup-1.0.0-x64.exe)
+[`release/Rift-Local-Setup-1.3.0-x64.exe`](release/Rift-Local-Setup-1.3.0-x64.exe)
 
 Windows may show a SmartScreen warning because this local build is not code-signed. Production releases should be signed; allow the firewall prompt on **Private networks only**.
 
@@ -35,20 +35,25 @@ For development with live reload, use `npm.cmd run dev` and open the printed Vit
 
 - 950 currently cataloged English printings from Origins, Origins: Proving Grounds, Spiritforged, and Unleashed
 - Search and filters for set, type, domain, rarity, and name
-- Device-local deck storage with Legend, Chosen Champion, 40-card main deck, 12-rune, and 3-unique-battlefield validation
-- Two-player LAN rooms with reconnect tokens, private hands, server-side shuffle, draw, play, discard, exhaust, battlefield placement, score, energy, and turn controls
+- All seven released ready-to-play Champion Decks: Jinx, Viktor, Lee Sin, Fiora, Rumble, Vi, and Vex
+- Custom deck validation for one Legend, a 40-card Main Deck (including the Chosen Champion), 12 Runes, three uniquely named Battlefields, name-based copy limits, valid card types, and the current ban list
+- Host-local username/password accounts with scrypt-hashed passwords, signed sessions, and per-account deck saves; guest decks remain available after sign-out
+- Two-player LAN rooms with reconnect tokens, private hands, server-side shuffle, opening hands and mulligans, official turn phases, Runes, movement, showdowns, combat, Hold/Conquer scoring, burnout, and the 8-point strict-lead victory check
 - Responsive layouts for desktop, tablet, and phone
 - One-click Windows NSIS installer and in-app update center
 
 Card metadata is bundled in `public/cards.json`; artwork loads from the image URLs in the catalog and has an in-app fallback if an image is unavailable. Run `npm.cmd run sync:cards` to refresh the catalog from the public [RiftScribe API](https://riftscribe.gg/api-docs).
 
-The live table is intentionally a shared tabletop rather than an automated rules engine: players resolve card text and legal targets just as they would with physical cards, while the server protects hidden zones and synchronizes public state.
+Version 1.3 implements the universal best-of-one Duel procedure from the [official Riftbound Rules Hub](https://playriftbound.com/en-us/rules-hub/) and Core Rules dated March 30, 2026. Printed card abilities remain player-resolved through constrained, logged effect controls because the bundled public catalog does not include structured card rules, Champion tags, Signature markers, or complete domain requirements. The app therefore does not claim full automatic card-by-card rules enforcement.
+
+Local accounts are stored only on the host computer and are not cloud accounts. Password and session traffic is accepted on loopback or HTTPS; account actions are intentionally disabled over unencrypted LAN HTTP. Remote devices can still use guest decks and play through the host invite.
 
 ## Verification
 
 ```powershell
 npm.cmd run check
 npm.cmd run build
+npm.cmd test
 npm.cmd run test:lan
 ```
 

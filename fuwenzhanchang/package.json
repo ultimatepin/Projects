@@ -3,7 +3,7 @@
   "description": "A local-first Riftbound card library, deck builder, and private two-device LAN tabletop.",
   "author": "ultimatepin",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.3.0",
   "type": "module",
   "main": "electron/main.mjs",
   "scripts": {
@@ -18,6 +18,7 @@
     "release:win": "npm run build && electron-builder --config electron-builder.config.cjs --win nsis --x64 --publish always",
     "icon": "powershell -ExecutionPolicy Bypass -File scripts/create-icon.ps1",
     "sync:cards": "node scripts/sync-cards.mjs",
+    "test": "node --test server/auth/localAuth.test.mjs server/officialGame.test.mjs",
     "test:lan": "node scripts/smoke-test.mjs",
     "check": "eslint ."
   },

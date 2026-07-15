@@ -7,6 +7,16 @@ import { fileURLToPath } from "node:url";
 
 import express from "express";
 import { Server as SocketIOServer } from "socket.io";
+import { createLocalAccountRouter } from "./auth/accountRouter.js";
+import {
+  applyOfficialAction,
+  createOfficialGame,
+  OFFICIAL_CORE_RULES_VERSION,
+  serialiseOfficialGame,
+  validateDeckDefinition,
+} from "./officialGame.js";
+import { AccountDeckStore } from "./storage/accountDeckStore.js";
+import { LocalAccountStore } from "./storage/localAccountStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -24,19 +34,21 @@ const EMPTY_ROOM_TTL_MS = readPositiveInteger(
   process.env.EMPTY_ROOM_TTL_MS,
   30 * 60 * 1000,
 );
-const MAX_DECK_SIZE = readPositiveInteger(process.env.MAX_DECK_SIZE, 200);
 const MAX_LOG_ENTRIES = 100;
 const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const ZONES = new Set(["deck", "hand", "board", "discard", "banished"]);
 const serverId = crypto.randomUUID();
 const NOOP_ACK = () => {};
+const cardsById = loadCardCatalog();
+const CASUAL_EXACT_PRECON_FINGERPRINTS = new Set([
+  // Unchanged Origins Jinx Champion Deck; Riot's Casual precon ban exception.
+  "8be87d1c70a50277670c91269b6e80abe1de88858da1479783be6b1ba110f691",
+]);
 
 /** @type {Map<string, ReturnType<typeof createRoomRecord>>} */
 const rooms = new Map();
 
 const app = express();
 app.disable("x-powered-by");
-app.use(express.json({ limit: "32kb" }));
 app.use((request, response, next) => {
   const configuredOrigins = process.env.CORS_ORIGIN
     ?.split(",")
@@ -50,14 +62,23 @@ app.use((request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", requestOrigin || "*");
   }
   response.setHeader("Vary", "Origin");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  response.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Rift-CSRF");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (request.method === "OPTIONS") {
     response.sendStatus(204);
     return;
   }
   next();
 });
+
+app.use(
+  "/api/account",
+  createLocalAccountRouter({
+    accountStore: new LocalAccountStore(),
+    deckStore: new AccountDeckStore(),
+  }),
+);
+app.use(express.json({ limit: "64kb" }));
 
 app.get("/api/health", (_request, response) => {
   let connectedPlayers = 0;
@@ -72,6 +93,8 @@ app.get("/api/health", (_request, response) => {
     service: "riftbound-lan-server",
     rooms: rooms.size,
     connectedPlayers,
+    cardCount: cardsById.size,
+    coreRulesVersion: OFFICIAL_CORE_RULES_VERSION,
     uptimeSeconds: Math.floor(process.uptime()),
     now: new Date().toISOString(),
   });
@@ -272,7 +295,7 @@ io.on("connection", (socket) => {
       }
       const payload = asObject(rawPayload);
       const ready = payload.ready === undefined ? true : Boolean(payload.ready);
-      if (ready && player.deckList.length === 0) {
+      if (ready && !player.deckDefinition) {
         throw protocolError("DECK_REQUIRED", "Choose a deck before becoming ready.");
       }
       player.ready = ready;
@@ -364,8 +387,8 @@ function createRoomRecord(code) {
     hostPlayerId: null,
     turnPlayerId: null,
     winnerPlayerId: null,
+    game: null,
     players: new Map(),
-    counters: {},
     log: [],
     processedActionIds: new Set(),
     processedActionQueue: [],
@@ -383,46 +406,29 @@ function createPlayer(name, seat) {
     disconnectedAt: null,
     disconnectTimer: null,
     ready: false,
-    score: 0,
-    counters: {},
-    deckList: [],
-    zones: emptyZones(),
+    deckDefinition: null,
+    allowExactPrecon: false,
   };
 }
 
-function emptyZones() {
-  return { deck: [], hand: [], board: [], discard: [], banished: [] };
-}
-
-function createCardInstances(deckList, playerId) {
-  return deckList.map((cardId) => ({
-    instanceId: crypto.randomUUID(),
-    cardId,
-    ownerPlayerId: playerId,
-    faceDown: false,
-    counters: {},
-    exhausted: false,
-  }));
-}
-
 function setPlayerDeck(player, rawDeck) {
-  if (!Array.isArray(rawDeck)) {
-    throw protocolError("INVALID_DECK", "The deck must be an array of card IDs.");
-  }
-  if (rawDeck.length > MAX_DECK_SIZE) {
+  const source = asObject(rawDeck);
+  if (source === rawDeck && Object.keys(source).length === 0) {
     throw protocolError(
       "INVALID_DECK",
-      `A deck cannot contain more than ${MAX_DECK_SIZE} cards.`,
+      "Choose a complete deck with a Legend, 40 Main Deck cards, 12 Runes, and 3 Battlefields.",
     );
   }
-  player.deckList = rawDeck.map((entry) => {
-    const cardId = typeof entry === "string" ? entry : entry?.cardId ?? entry?.id;
-    if (typeof cardId !== "string" || !cardId.trim() || cardId.length > 120) {
-      throw protocolError("INVALID_DECK", "Every deck entry needs a valid card ID.");
-    }
-    return cardId.trim();
-  });
-  player.zones = emptyZones();
+  const allowExactPrecon = source.casualPreconException === true
+    && CASUAL_EXACT_PRECON_FINGERPRINTS.has(deckDefinitionFingerprint(source));
+  player.deckDefinition = validateDeckDefinition(
+    { ...source, isExactPrecon: allowExactPrecon },
+    cardsById,
+    { allowExactPrecon },
+  );
+  player.allowExactPrecon = Boolean(
+    allowExactPrecon && player.deckDefinition.exactPreconDeclared,
+  );
 }
 
 function startGame(room) {
@@ -433,171 +439,71 @@ function startGame(room) {
   if (players.length !== 2) {
     throw protocolError("TWO_PLAYERS_REQUIRED", "Two players are required.");
   }
-  if (players.some((player) => !player.ready || player.deckList.length === 0)) {
+  if (players.some((player) => !player.ready || !player.deckDefinition)) {
     throw protocolError("PLAYERS_NOT_READY", "Both players must be ready with decks.");
   }
 
-  for (const player of players) {
-    player.zones = emptyZones();
-    player.zones.deck = shuffle(createCardInstances(player.deckList, player.id));
-    player.score = 0;
-    player.counters = {};
-  }
+  room.game = createOfficialGame(
+    players.map((player) => ({
+      id: player.id,
+      name: player.name,
+      deck: {
+        ...player.deckDefinition,
+        isExactPrecon: player.allowExactPrecon,
+      },
+      allowExactPrecon: player.allowExactPrecon,
+    })),
+    cardsById,
+  );
   room.status = "playing";
-  room.turnPlayerId = players[0].id;
+  room.turnPlayerId = room.game.turn.activePlayerId;
   room.winnerPlayerId = null;
-  room.counters = {};
   room.log = [];
   room.processedActionIds.clear();
   room.processedActionQueue = [];
-  touchRoom(room, `${players[0].name} takes the first turn.`);
+  touchRoom(
+    room,
+    `${room.game.players.find((candidate) => candidate.id === room.game.firstPlayerId)?.name || "A player"} was selected to play first. Opening mulligans begin now.`,
+  );
 }
 
 function resetGame(room) {
   room.status = "lobby";
   room.turnPlayerId = null;
   room.winnerPlayerId = null;
-  room.counters = {};
+  room.game = null;
   room.log = [];
   room.processedActionIds.clear();
   room.processedActionQueue = [];
   for (const player of room.players.values()) {
     player.ready = false;
-    player.score = 0;
-    player.counters = {};
-    player.zones = emptyZones();
   }
+}
+
+function syncRoomFromOfficialGame(room) {
+  if (!room.game) return;
+  const finished = room.game.status === "finished";
+  room.status = finished ? "finished" : "playing";
+  room.turnPlayerId = finished ? null : room.game.turn.activePlayerId;
+  room.winnerPlayerId = room.game.winnerPlayerId;
+}
+
+function forfeitOfficialGame(room, player) {
+  if (room.game?.status !== "finished") {
+    applyOfficialAction(room.game, player.id, { type: "CONCEDE" }, cardsById);
+  }
+  syncRoomFromOfficialGame(room);
 }
 
 function applyGameAction(room, player, rawAction) {
-  const action = String(rawAction.type || "").trim().toUpperCase();
-  const payload = asObject(rawAction.payload);
-
-  switch (action) {
-    case "DRAW": {
-      const count = clampInteger(payload.count ?? 1, 1, 20, "draw count");
-      const available = Math.min(count, player.zones.deck.length);
-      for (let index = 0; index < available; index += 1) {
-        player.zones.hand.push(player.zones.deck.pop());
-      }
-      return `${player.name} drew ${available} card${available === 1 ? "" : "s"}.`;
-    }
-
-    case "MOVE_CARD": {
-      const from = requireZone(payload.from);
-      const to = requireZone(payload.to);
-      const instanceId = String(payload.instanceId || "");
-      const sourceIndex = player.zones[from].findIndex(
-        (card) => card.instanceId === instanceId,
-      );
-      if (sourceIndex < 0) {
-        throw protocolError("CARD_NOT_FOUND", `That card is not in ${from}.`);
-      }
-      const [card] = player.zones[from].splice(sourceIndex, 1);
-      if (payload.faceDown !== undefined) card.faceDown = Boolean(payload.faceDown);
-      insertCard(player.zones[to], card, payload.position);
-      return `${player.name} moved a card from ${from} to ${to}.`;
-    }
-
-    case "SHUFFLE_ZONE": {
-      const zone = requireZone(payload.zone ?? "deck");
-      player.zones[zone] = shuffle(player.zones[zone]);
-      return `${player.name} shuffled their ${zone}.`;
-    }
-
-    case "SET_SCORE": {
-      player.score = clampInteger(payload.score, -999, 9999, "score");
-      return `${player.name} set their score to ${player.score}.`;
-    }
-
-    case "ADJUST_SCORE": {
-      const delta = clampInteger(payload.delta, -999, 999, "score adjustment");
-      player.score = Math.max(-999, Math.min(9999, player.score + delta));
-      return `${player.name} changed their score by ${delta}.`;
-    }
-
-    case "SET_COUNTER": {
-      const key = sanitiseCounterKey(payload.key);
-      const value = clampInteger(payload.value, -9999, 9999, "counter value");
-      if (payload.scope === "game") {
-        room.counters[key] = value;
-      } else {
-        player.counters[key] = value;
-      }
-      return `${player.name} set ${key} to ${value}.`;
-    }
-
-    case "SET_CARD_COUNTER": {
-      const card = findOwnedCard(player, payload.instanceId);
-      const key = sanitiseCounterKey(payload.key);
-      card.counters[key] = clampInteger(
-        payload.value,
-        -9999,
-        9999,
-        "card counter value",
-      );
-      return `${player.name} updated a card counter.`;
-    }
-
-    case "SET_CARD_STATE": {
-      const card = findOwnedCard(player, payload.instanceId);
-      if (payload.exhausted !== undefined) card.exhausted = Boolean(payload.exhausted);
-      if (payload.faceDown !== undefined) card.faceDown = Boolean(payload.faceDown);
-      return `${player.name} updated a card.`;
-    }
-
-    case "END_TURN": {
-      if (room.turnPlayerId !== player.id) {
-        throw protocolError("NOT_YOUR_TURN", "It is not your turn.");
-      }
-      const opponent = [...room.players.values()].find(
-        (candidate) => candidate.id !== player.id,
-      );
-      if (!opponent) throw protocolError("OPPONENT_MISSING", "No opponent is present.");
-      room.turnPlayerId = opponent.id;
-      return `${player.name} ended their turn.`;
-    }
-
-    case "SET_TURN": {
-      if (room.hostPlayerId !== player.id) {
-        throw protocolError("HOST_ONLY", "Only the host can correct the active turn.");
-      }
-      const target = room.players.get(String(payload.playerId || ""));
-      if (!target) throw protocolError("PLAYER_NOT_FOUND", "Player not found.");
-      room.turnPlayerId = target.id;
-      return `${player.name} set the active turn to ${target.name}.`;
-    }
-
-    case "CONCEDE": {
-      const opponent = [...room.players.values()].find(
-        (candidate) => candidate.id !== player.id,
-      );
-      room.status = "finished";
-      room.turnPlayerId = null;
-      room.winnerPlayerId = opponent?.id ?? null;
-      return `${player.name} conceded the game.`;
-    }
-
-    default:
-      throw protocolError("UNKNOWN_ACTION", `Unknown game action: ${action || "(empty)"}.`);
-  }
-}
-
-function findOwnedCard(player, rawInstanceId) {
-  const instanceId = String(rawInstanceId || "");
-  for (const cards of Object.values(player.zones)) {
-    const card = cards.find((candidate) => candidate.instanceId === instanceId);
-    if (card) return card;
-  }
-  throw protocolError("CARD_NOT_FOUND", "Card not found.");
-}
-
-function insertCard(cards, card, rawPosition) {
-  if (rawPosition === "top") cards.push(card);
-  else if (rawPosition === "bottom") cards.unshift(card);
-  else if (Number.isInteger(rawPosition)) {
-    cards.splice(Math.max(0, Math.min(cards.length, rawPosition)), 0, card);
-  } else cards.push(card);
+  if (!room.game) throw protocolError("GAME_NOT_ACTIVE", "The official game is missing.");
+  const historyLength = room.game.history.length;
+  applyOfficialAction(room.game, player.id, rawAction, cardsById);
+  syncRoomFromOfficialGame(room);
+  return room.game.history.at(-1)?.message
+    || (room.game.history.length === historyLength
+      ? `${player.name} completed an official game action.`
+      : `${player.name} advanced the game.`);
 }
 
 function attachPlayerToSocket(room, player, socket) {
@@ -628,12 +534,7 @@ function markPlayerDisconnected(room, player) {
       return;
     }
     if (room.status === "playing") {
-      const opponent = [...room.players.values()].find(
-        (candidate) => candidate.id !== player.id,
-      );
-      room.status = "finished";
-      room.turnPlayerId = null;
-      room.winnerPlayerId = opponent?.id ?? null;
+      forfeitOfficialGame(room, player);
       touchRoom(room, `${player.name} did not reconnect in time.`);
       broadcastState(room, "game:disconnect-forfeit");
     }
@@ -649,15 +550,10 @@ function leaveRoom(room, player, socket) {
   delete socket.data.playerId;
 
   if (room.status === "playing") {
-    const opponent = [...room.players.values()].find(
-      (candidate) => candidate.id !== player.id,
-    );
     player.connected = false;
     player.socketId = null;
     player.reconnectToken = crypto.randomBytes(32).toString("base64url");
-    room.status = "finished";
-    room.turnPlayerId = null;
-    room.winnerPlayerId = opponent?.id ?? null;
+    forfeitOfficialGame(room, player);
     touchRoom(room, `${player.name} left and forfeited the game.`);
     broadcastState(room, "game:player-forfeit");
     return;
@@ -700,59 +596,23 @@ function serialiseRoom(room, viewerPlayerId) {
     hostPlayerId: room.hostPlayerId,
     turnPlayerId: room.turnPlayerId,
     winnerPlayerId: room.winnerPlayerId,
-    counters: { ...room.counters },
+    game: room.game ? serialiseOfficialGame(room.game, viewerPlayerId) : null,
     players: [...room.players.values()]
       .sort((a, b) => a.seat - b.seat)
-      .map((player) => serialisePlayer(player, viewerPlayerId)),
+      .map((player) => serialiseLobbyPlayer(player)),
     log: room.log.slice(-MAX_LOG_ENTRIES),
   };
 }
 
-function serialisePlayer(player, viewerPlayerId) {
-  const isViewer = player.id === viewerPlayerId;
+function serialiseLobbyPlayer(player) {
   return {
     id: player.id,
     name: player.name,
     seat: player.seat,
     connected: player.connected,
     ready: player.ready,
-    score: player.score,
-    counters: { ...player.counters },
-    deckSize: player.deckList.length,
-    zones: {
-      deck: { count: player.zones.deck.length },
-      hand: {
-        count: player.zones.hand.length,
-        cards: isViewer
-          ? player.zones.hand.map((card) => serialiseCard(card, true))
-          : undefined,
-      },
-      board: {
-        count: player.zones.board.length,
-        cards: player.zones.board.map((card) =>
-          serialiseCard(card, isViewer || !card.faceDown),
-        ),
-      },
-      discard: {
-        count: player.zones.discard.length,
-        cards: player.zones.discard.map((card) => serialiseCard(card, true)),
-      },
-      banished: {
-        count: player.zones.banished.length,
-        cards: player.zones.banished.map((card) => serialiseCard(card, true)),
-      },
-    },
-  };
-}
-
-function serialiseCard(card, revealIdentity) {
-  return {
-    instanceId: card.instanceId,
-    cardId: revealIdentity ? card.cardId : null,
-    ownerPlayerId: card.ownerPlayerId,
-    faceDown: card.faceDown,
-    exhausted: card.exhausted,
-    counters: { ...card.counters },
+    deckSize: player.deckDefinition?.mainDeck?.length || 0,
+    deckReady: Boolean(player.deckDefinition),
   };
 }
 
@@ -814,14 +674,6 @@ function sanitisePlayerName(rawName) {
   return name || "Player";
 }
 
-function sanitiseCounterKey(rawKey) {
-  const key = String(rawKey || "").trim().slice(0, 40);
-  if (!/^[a-zA-Z0-9 _-]+$/.test(key)) {
-    throw protocolError("INVALID_COUNTER", "Counter names may use letters, numbers, spaces, _ and -.");
-  }
-  return key;
-}
-
 function sanitiseActionId(rawActionId) {
   if (rawActionId === undefined || rawActionId === null) return null;
   const actionId = String(rawActionId).trim();
@@ -837,34 +689,6 @@ function rememberActionId(room, key) {
   if (room.processedActionQueue.length > 500) {
     room.processedActionIds.delete(room.processedActionQueue.shift());
   }
-}
-
-function requireZone(rawZone) {
-  const zone = String(rawZone || "").toLowerCase();
-  if (!ZONES.has(zone)) {
-    throw protocolError("INVALID_ZONE", `Unknown card zone: ${zone || "(empty)"}.`);
-  }
-  return zone;
-}
-
-function clampInteger(rawValue, minimum, maximum, label) {
-  const value = Number(rawValue);
-  if (!Number.isInteger(value) || value < minimum || value > maximum) {
-    throw protocolError(
-      "INVALID_NUMBER",
-      `${label} must be an integer from ${minimum} to ${maximum}.`,
-    );
-  }
-  return value;
-}
-
-function shuffle(cards) {
-  const shuffled = [...cards];
-  for (let index = shuffled.length - 1; index > 0; index -= 1) {
-    const target = crypto.randomInt(index + 1);
-    [shuffled[index], shuffled[target]] = [shuffled[target], shuffled[index]];
-  }
-  return shuffled;
 }
 
 function tokensMatch(expected, received) {
@@ -987,6 +811,56 @@ function isAllowedLanOrigin(origin) {
   } catch {
     return false;
   }
+}
+
+function loadCardCatalog() {
+  const candidates = [
+    process.env.RIFT_CARDS_FILE,
+    path.join(projectRoot, "public", "cards.json"),
+    path.join(productionDist, "cards.json"),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const cards = JSON.parse(fs.readFileSync(candidate, "utf8"));
+      if (!Array.isArray(cards) || !cards.length) continue;
+      const catalog = new Map(
+        cards
+          .filter((card) => card && typeof card.id === "string")
+          .map((card) => [card.id, card]),
+      );
+      if (catalog.size) return catalog;
+    } catch (error) {
+      console.warn(`Could not load card catalog from ${candidate}:`, error.message);
+    }
+  }
+  throw new Error("Could not load cards.json for official deck and game validation.");
+}
+
+function deckDefinitionFingerprint(rawDeck) {
+  const source = asObject(rawDeck);
+  const expand = (value) => {
+    if (Array.isArray(value)) return value.map(String).sort();
+    if (!value || typeof value !== "object") return [];
+    const cards = [];
+    for (const [id, rawCount] of Object.entries(value)) {
+      const count = Number(rawCount);
+      if (!id || !Number.isInteger(count) || count < 1 || count > 100) return [];
+      cards.push(...Array.from({ length: count }, () => id));
+    }
+    return cards.sort();
+  };
+  const canonical = {
+    legendId: String(source.legendId || ""),
+    chosenChampionId: String(source.chosenChampionId ?? source.championId ?? ""),
+    mainDeck: expand(source.mainDeck ?? source.cards),
+    runeDeck: expand(source.runeDeck ?? source.runes),
+    battlefields: expand(source.battlefields ?? source.battlefieldIds),
+  };
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonical), "utf8")
+    .digest("hex");
 }
 
 const isDirectRun = process.argv[1]

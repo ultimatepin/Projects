@@ -163,6 +163,7 @@ ipcMain.handle('updates:install', async (event) => {
 async function startServer() {
   const appRoot = app.getAppPath()
   process.env.RIFT_DIST_DIR = path.join(appRoot, 'dist')
+  process.env.RIFT_ACCOUNT_DATA_DIR = path.join(app.getPath('userData'), 'accounts')
   serverApi = await import('../server/index.js')
   const port = await findLanPort()
   serverInfo = await serverApi.startLanServer({ port, host: '0.0.0.0', quiet: true })

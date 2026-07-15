@@ -1,4 +1,4 @@
-import { createElement, useEffect, useMemo, useRef, useState } from 'react'
+import { createElement, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft,
   BookOpen,
@@ -26,11 +26,16 @@ import {
   Zap,
 } from 'lucide-react'
 import { io } from 'socket.io-client'
+import AccountModal from './components/AccountModal'
 import HelpModal from './components/HelpModal'
+import OfficialGameBoard from './components/OfficialGameBoard'
 import UpdatesView from './components/UpdatesView'
+import { CHAMPION_DECKS } from './data/championDecks'
 import { fallbackCards } from './data/fallbackCards'
+import { getAccountDecks, getAccountSession, loginAccount, logoutAccount, registerAccount, replaceAccountDecks } from './lib/account'
 import { copyText, parseInvite, readStorage, removeStorage, writeStorage } from './lib/browser'
 import { cardImage, cardSearchText, deckCount, deckEntries, DOMAIN_COLORS, SET_NAMES, titleCase, zoneCount } from './lib/cards'
+import { championDeckToUserDeck, deckDefinition, getPlayableDeckChoices, validateDeck } from './lib/decks'
 import { createDeck, loadDecks, saveDecks } from './lib/storage'
 
 const NAV = [
@@ -42,6 +47,7 @@ const NAV = [
 
 const FILTER_TYPES = ['All', 'Unit', 'Spell', 'Gear', 'Battlefield', 'Legend', 'Rune']
 const FILTER_DOMAINS = ['all', 'fury', 'calm', 'mind', 'body', 'chaos', 'order', 'colorless']
+const ACCOUNT_SAVE_RETRY_DELAYS = [600, 1800]
 
 function normalizeDeck(deck) {
   return {
@@ -84,7 +90,8 @@ function Brand({ compact = false }) {
   )
 }
 
-function Sidebar({ page, onPage, onHelp }) {
+function Sidebar({ page, onPage, onHelp, account, onAccount }) {
+  const username = account?.user?.username
   return (
     <aside className="sidebar">
       <Brand />
@@ -109,8 +116,10 @@ function Sidebar({ page, onPage, onHelp }) {
       </div>
       <div className="sidebar-footer">
         <button onClick={onHelp}><CircleHelp size={17} /> How to play</button>
-        <div className="profile-dot">P1</div>
-        <div><strong>Player one</strong><span>Ready to play</span></div>
+        <button className="sidebar-account" onClick={onAccount}>
+          <span className="profile-dot">{username?.slice(0, 2).toUpperCase() || <UserRound size={15} />}</span>
+          <span><strong>{username || 'Local account'}</strong><small>{username ? 'Decks saved on this host' : 'Sign in to save decks'}</small></span>
+        </button>
       </div>
     </aside>
   )
@@ -128,13 +137,14 @@ function MobileNav({ page, onPage }) {
   )
 }
 
-function Topbar({ title, kicker, onMenu, onHelp }) {
+function Topbar({ title, kicker, onMenu, onHelp, account, onAccount }) {
   return (
     <header className="topbar">
       <button className="mobile-menu" onClick={onMenu} aria-label="Open menu"><Menu /></button>
       <div><span>{kicker}</span><strong>{title}</strong></div>
       <div className="topbar-actions">
         <span className="connection-pill"><i /> Server online</span>
+        <button className="account-pill" onClick={onAccount}><UserRound size={15} />{account?.user?.username || 'Sign in'}</button>
         <button className="icon-btn" onClick={onHelp} aria-label="Help"><CircleHelp size={19} /></button>
       </div>
     </header>
@@ -303,10 +313,6 @@ function zoneForCard(card) {
   return 'cards'
 }
 
-function expandedMainDeck(deck) {
-  return Object.entries(deck?.cards || {}).flatMap(([cardId, count]) => Array.from({ length: count }, () => cardId))
-}
-
 function DecksView({ cards, decks, setDecks, onToast }) {
   const [activeId, setActiveId] = useState(decks[0]?.id || null)
   const [query, setQuery] = useState('')
@@ -327,12 +333,25 @@ function DecksView({ cards, decks, setDecks, onToast }) {
     setActiveId(next.id)
   }
 
+  function addChampionDeck(presetId) {
+    const preset = CHAMPION_DECKS.find((item) => item.id === presetId)
+    if (!preset) return
+    const next = championDeckToUserDeck(preset)
+    setDecks((current) => [...current, next])
+    setActiveId(next.id)
+    onToast?.(`${preset.champion} Champion Deck added to My decks.`)
+  }
+
   function updateDeck(patch) {
     setDecks((current) => current.map((item) => item.id === activeId ? { ...item, ...patch, updatedAt: Date.now() } : item))
   }
 
   function addCard(card) {
     const zone = zoneForCard(card)
+    if (card.is_banned) {
+      onToast?.(`${card.name} is on the current Constructed ban list.`, 'error')
+      return
+    }
     if (zone === 'legend') {
       updateDeck({ legendId: card.id })
       return
@@ -383,6 +402,9 @@ function DecksView({ cards, decks, setDecks, onToast }) {
         <h1>Build your first deck</h1>
         <p>Choose a Legend, add a 40-card main deck, 12 runes, and 3 battlefields. Everything is saved locally.</p>
         <button className="primary-btn" onClick={addNewDeck}><Plus size={18} /> Create a deck</button>
+        <div className="precon-starter-grid">
+          {CHAMPION_DECKS.map((preset) => <button key={preset.id} onClick={() => addChampionDeck(preset.id)}><Swords size={14} /><span><strong>{preset.champion}</strong><small>{SET_NAMES[preset.setId] || preset.setId} Champion Deck</small></span></button>)}
+        </div>
         <div className="format-row"><span><strong>1</strong> Legend</span><span><strong>40</strong> Main</span><span><strong>12</strong> Runes</span><span><strong>3</strong> Fields</span></div>
       </div>
     )
@@ -396,7 +418,9 @@ function DecksView({ cards, decks, setDecks, onToast }) {
   })
   const legend = cardsById[deck.legendId]
   const champion = cardsById[deck.championId]
-  const complete = Boolean(legend && champion && deck.cards?.[champion.id]) && deckCount(deck) === 40 && zoneCount(deck.runes) === 12 && zoneCount(deck.battlefields) === 3
+  const validation = validateDeck(deck, cards)
+  const complete = validation.valid
+  const deckStatus = validation.errors[0]?.message || validation.warnings[0]?.message || 'Official structural checks passed; tag/domain metadata is unavailable.'
 
   return (
     <div className="deck-builder">
@@ -405,6 +429,7 @@ function DecksView({ cards, decks, setDecks, onToast }) {
           <span className="eyebrow">Deck builder</span>
           <label><select value={activeId} onChange={(event) => setActiveId(event.target.value)}>{decks.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={16} /></label>
           <button className="icon-btn" onClick={addNewDeck} title="New deck"><Plus size={18} /></button>
+          <label className="precon-import"><select value="" onChange={(event) => addChampionDeck(event.target.value)} aria-label="Add a Champion Deck"><option value="">Add Champion Deck…</option>{CHAMPION_DECKS.map((preset) => <option key={preset.id} value={preset.id}>{preset.champion} · {SET_NAMES[preset.setId] || preset.setId}</option>)}</select><ChevronDown size={16} /></label>
         </div>
         <div className={`legality ${complete ? 'complete' : ''}`}><span><Check size={13} /></span>{complete ? 'Ready to play' : 'In progress'}</div>
       </div>
@@ -453,7 +478,7 @@ function DecksView({ cards, decks, setDecks, onToast }) {
             ))}
             {!Object.keys(deckZone).length && <div className="zone-empty"><BookOpen size={22} /><span>No cards here yet</span><small>Add {deckTab === 'cards' ? 'units, spells, and gear' : deckTab} from the catalog.</small></div>}
           </div>
-          <div className="deck-panel-footer"><span><i className={complete ? 'done' : ''}>{complete ? <Check size={12} /> : '!'}</i>{complete ? 'Deck complete' : 'Finish deck requirements'}</span><button onClick={async () => { try { await copyText(JSON.stringify(deck, null, 2)); onToast?.('Deck list copied.') } catch { onToast?.('Could not copy. Select and copy the deck manually.', 'error') } }}><Copy size={15} /> Copy list</button></div>
+          <div className="deck-panel-footer"><span title={deckStatus}><i className={complete ? 'done' : ''}>{complete ? <Check size={12} /> : '!'}</i>{complete ? (validation.warnings.length ? 'Playable · casual exception' : 'Deck complete') : deckStatus}</span><button onClick={async () => { try { await copyText(JSON.stringify(deck, null, 2)); onToast?.('Deck list copied.') } catch { onToast?.('Could not copy. Select and copy the deck manually.', 'error') } }}><Copy size={15} /> Copy list</button></div>
         </aside>
       </div>
       <CardModal card={selectedCard} onClose={() => setSelectedCard(null)} onAdd={addCard} count={selectedCard ? allDeckCounts[selectedCard.id] || 0 : 0} />
@@ -473,7 +498,7 @@ function PlayView({ decks, cards, onToast }) {
   }, [])
   const [name, setName] = useState(() => readStorage(localStorage, 'rift-local-player', ''))
   const [roomCode, setRoomCode] = useState(inviteFromUrl?.code || '')
-  const [selectedDeck, setSelectedDeck] = useState(decks[0]?.id || '')
+  const [selectedDeck, setSelectedDeck] = useState(`precon:${CHAMPION_DECKS[0].id}`)
   const [serverOrigin, setServerOrigin] = useState(inviteFromUrl?.origin || savedSession?.serverOrigin || window.location.origin)
   const [networkUrls, setNetworkUrls] = useState([])
   const [room, setRoom] = useState(null)
@@ -522,18 +547,27 @@ function PlayView({ decks, cards, onToast }) {
   }, [serverOrigin])
 
   const cardsById = useMemo(() => Object.fromEntries(cards.map((card) => [card.id, card])), [cards])
-  const chosen = decks.find((deck) => deck.id === selectedDeck)
-  const canJoin = connected && roomCode.length === 6 && !pending
+  const playableChoices = useMemo(() => getPlayableDeckChoices(decks, cards), [cards, decks])
+  const chosen = playableChoices.find((deck) => deck.id === selectedDeck)
+  const userDeckOptions = useMemo(() => decks.map((deck) => ({ deck, validation: validateDeck(deck, cards) })), [cards, decks])
+  const canJoin = connected && Boolean(chosen) && roomCode.length === 6 && !pending
 
-  function quickDeck() {
-    return cards.filter((card) => !['Legend', 'Rune', 'Battlefield'].includes(card.type) && !card.variant).slice(0, 40).map((card) => card.id)
-  }
+  useEffect(() => {
+    if (!chosen && playableChoices.length) setSelectedDeck(playableChoices[0].id)
+  }, [chosen, playableChoices])
 
   function playerPayload() {
     const cleanName = name.trim() || 'Player'
     writeStorage(localStorage, 'rift-local-player', cleanName)
-    const selectedCards = expandedMainDeck(chosen)
-    return { playerName: cleanName, deck: selectedCards.length ? selectedCards : quickDeck() }
+    if (!chosen) throw new Error('Choose a complete, playable deck first.')
+    return {
+      playerName: cleanName,
+      deck: {
+        ...deckDefinition(chosen),
+        presetId: chosen.presetId || null,
+        casualPreconException: chosen.validation?.usedExactPreconException === true,
+      },
+    }
   }
 
   function friendlyError(response, fallback) {
@@ -569,12 +603,12 @@ function PlayView({ decks, cards, onToast }) {
   }
 
   function createRoom() {
-    requestRoom('room:create', playerPayload(), 'create')
+    try { requestRoom('room:create', playerPayload(), 'create') } catch (payloadError) { setError(payloadError.message) }
   }
 
   function joinRoom() {
     if (!canJoin) return
-    requestRoom('room:join', { ...playerPayload(), roomCode }, 'join')
+    try { requestRoom('room:join', { ...playerPayload(), roomCode }, 'join') } catch (payloadError) { setError(payloadError.message) }
   }
 
   function changeJoinValue(value) {
@@ -602,7 +636,7 @@ function PlayView({ decks, cards, onToast }) {
   }
 
   if (room?.status === 'playing' || room?.status === 'finished') {
-    return <GameBoard room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} cardsById={cardsById} connected={connected} error={error} onClearError={() => setError('')} onLeave={leaveRoom} />
+    return <OfficialGameBoard room={{ ...room, selfId: selfId || room.selfId }} socket={socketRef.current} cardsById={cardsById} connected={connected} error={error} onError={setError} onClearError={() => setError('')} onLeave={leaveRoom} />
   }
 
   if (room) {
@@ -629,8 +663,12 @@ function PlayView({ decks, cards, onToast }) {
         <div className="room-card-head"><span className="room-icon"><Swords /></span><div><span className="eyebrow">Local duel</span><h2>Enter the arena</h2></div><span className={`server-badge ${connected ? '' : 'offline'}`}><i />{connected ? 'Server ready' : 'Connecting'}</span></div>
         <div className="target-host"><Globe2 size={15} /><span><small>Connected host</small><strong>{serverOrigin.replace(/^https?:\/\//, '')}</strong></span></div>
         <label className="field-label">Player name<input value={name} onChange={(event) => setName(event.target.value)} maxLength={24} placeholder="What should we call you?" /></label>
-        <label className="field-label">Battle deck<select value={selectedDeck} onChange={(event) => setSelectedDeck(event.target.value)}><option value="">Quick demo deck · 40 cards</option>{decks.map((deck) => <option key={deck.id} value={deck.id}>{deck.name} · {deckCount(deck)}/40</option>)}</select></label>
-        <button className="primary-btn wide host-btn" onClick={createRoom} disabled={!connected || Boolean(pending)}><Wifi size={18} /> {pending === 'create' ? 'Creating room…' : 'Create private room'}</button>
+        <label className="field-label">Battle deck<select value={selectedDeck} onChange={(event) => setSelectedDeck(event.target.value)}>
+          <optgroup label="Official Champion Decks">{playableChoices.filter((choice) => choice.kind === 'precon').map((choice) => <option key={choice.id} value={choice.id}>{choice.name}</option>)}</optgroup>
+          {userDeckOptions.length > 0 && <optgroup label="My decks">{userDeckOptions.map(({ deck, validation }) => <option key={deck.id} value={deck.id} disabled={!validation.playable}>{deck.name} · {validation.playable ? 'ready' : validation.errors[0]?.message || 'incomplete'}</option>)}</optgroup>}
+        </select></label>
+        {chosen?.validation?.warnings?.[0] && <p className="deck-choice-warning">{chosen.validation.warnings[0].message}</p>}
+        <button className="primary-btn wide host-btn" onClick={createRoom} disabled={!connected || !chosen || Boolean(pending)}><Wifi size={18} /> {pending === 'create' ? 'Creating room…' : !chosen ? 'Loading playable decks…' : 'Create private room'}</button>
         <div className="or-divider"><span>or join a friend</span></div>
         <div className="join-row"><input value={roomCode} onChange={(event) => changeJoinValue(event.target.value)} onPaste={(event) => { const text = event.clipboardData.getData('text'); if (parseInvite(text)) { event.preventDefault(); changeJoinValue(text) } }} onKeyDown={(event) => event.key === 'Enter' && canJoin && joinRoom()} placeholder="CODE OR INVITE LINK" /><button className="outline-btn" onClick={joinRoom} disabled={!canJoin}>{pending === 'join' ? 'Joining…' : 'Join room'}</button></div>
         <p className="join-hint">If each device opened its own app, paste the host’s full invite link here.</p>
@@ -701,66 +739,144 @@ function RoomLobby({ room, socket, connected, networkUrls, serverOrigin, error, 
   )
 }
 
-function GameBoard({ room, socket, cardsById, connected, error, onClearError, onLeave }) {
-  const game = room
-  const self = game.players?.find((player) => player.id === room.selfId) || {}
-  const opponent = game.players?.find((player) => player.id !== room.selfId) || {}
-  const hand = self.zones?.hand?.cards || []
-  const [selected, setSelected] = useState(null)
-  const ownBoard = self.zones?.board?.cards || []
-  const opposingBoard = opponent.zones?.board?.cards || []
-  const selectedBoardCard = ownBoard.find((card) => card.instanceId === selected)
-  const canAct = connected && game.status === 'playing'
-
-  function action(type, payload = {}) {
-    if (!canAct) return
-    socket?.emit('game:action', { type, payload })
-  }
-
-  const fieldCards = (cards, field) => cards.filter((card) => {
-    const value = card.counters?.field
-    return field === -1 ? value == null || value === -1 : value === field
-  })
-
-  return (
-    <div className="game-board">
-      <div className="game-topbar"><button onClick={onLeave}><ArrowLeft size={16} /> Exit match</button><span>Room {room.code}</span><strong>{game.status === 'finished' ? (game.winnerPlayerId === room.selfId ? 'You won' : 'Match finished') : game.turnPlayerId === room.selfId ? 'Your turn' : `${opponent.name || 'Opponent'}’s turn`}</strong></div>
-      <section className="opponent-strip"><PlayerBadge player={opponent} /><div className="card-back-stack"><span /><b>{opponent.zones?.hand?.count ?? 0}</b><small>hand</small></div><ScoreControl value={opponent.score || 0} label="Opponent" readOnly /></section>
-      <section className="battlefield-mat">
-        <div className="mat-glow" />
-        <Zone label="Opponent base" cards={fieldCards(opposingBoard, -1)} cardsById={cardsById} compact />
-        <div className="battlefields-row">
-          {[0, 1, 2].map((index) => <Zone key={index} label={`Battlefield ${index + 1}`} cards={[...fieldCards(opposingBoard, index), ...fieldCards(ownBoard, index)]} cardsById={cardsById} selected={selected} onSelect={(instance) => instance.ownerPlayerId === room.selfId && setSelected(instance.instanceId)} landscape />)}
-        </div>
-        <Zone label="Your base" cards={fieldCards(ownBoard, -1)} cardsById={cardsById} selected={selected} onSelect={(instance) => setSelected(instance.instanceId)} compact />
-      </section>
-      <section className="player-strip"><PlayerBadge player={self} self /><div className="resource-counters"><ScoreControl value={self.counters?.energy || 0} label="Energy" disabled={!canAct} onChange={(delta) => action('SET_COUNTER', { key: 'energy', value: (self.counters?.energy || 0) + delta })} /><ScoreControl value={self.score || 0} label="Score" disabled={!canAct} onChange={(delta) => action('ADJUST_SCORE', { delta })} /></div><div className="deck-pile"><button disabled={!canAct || !self.zones?.deck?.count} onClick={() => action('DRAW')}><span /><b>{self.zones?.deck?.count ?? 0}</b><small>Draw</small></button></div></section>
-      {selectedBoardCard && <div className="card-action-bar"><span>Move selected card</span><button disabled={!canAct || (selectedBoardCard.counters?.field ?? -1) === -1} onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: -1 })}>Base</button>{[0, 1, 2].map((field) => <button key={field} disabled={!canAct || selectedBoardCard.counters?.field === field} onClick={() => action('SET_CARD_COUNTER', { instanceId: selected, key: 'field', value: field })}>Field {field + 1}</button>)}<button disabled={!canAct} onClick={() => action('SET_CARD_STATE', { instanceId: selected, exhausted: !selectedBoardCard.exhausted })}>{selectedBoardCard.exhausted ? 'Ready' : 'Exhaust'}</button><button disabled={!canAct} className="danger" onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'board', to: 'discard' }); setSelected(null) }}>Discard</button><button className="close-action" onClick={() => setSelected(null)}><X size={14} /></button></div>}
-      {error && <button className="play-error-banner game-error" onClick={onClearError}><span>!</span>{error}<X size={13} /></button>}
-      <section className="hand-zone"><div className="hand-label">Your hand <span>{hand.length}</span><small>{self.zones?.discard?.count || 0} discarded</small></div><div className="hand-cards">{hand.map((instance) => { const card = cardsById[instance.cardId]; return card ? <button key={instance.instanceId} className={selected === instance.instanceId ? 'selected' : ''} onClick={() => setSelected(instance.instanceId)}><CardArtwork card={card} /></button> : null })}</div><div className="turn-actions"><button className="outline-btn" disabled={!canAct || !hand.some((card) => card.instanceId === selected)} onClick={() => { action('MOVE_CARD', { instanceId: selected, from: 'hand', to: 'board' }); setSelected(null) }}>Play to base</button><button className="primary-btn" disabled={!canAct || game.turnPlayerId !== room.selfId} onClick={() => action('END_TURN')}>End turn <ArrowLeft className="arrow-right" size={16} /></button></div></section>
-    </div>
-  )
-}
-
-function PlayerBadge({ player, self }) {
-  return <div className="player-badge"><span>{player?.name?.slice(0, 2).toUpperCase() || 'P?'}</span><div><small>{self ? 'You' : 'Opponent'}</small><strong>{player?.name || 'Player'}</strong></div></div>
-}
-
-function ScoreControl({ value, label, onChange, readOnly = false, disabled = false }) {
-  return <div className="score-control"><small>{label}</small><span>{!readOnly && <button disabled={disabled} onClick={() => onChange(-1)}><Minus size={12} /></button>}<b>{value}</b>{!readOnly && <button disabled={disabled} onClick={() => onChange(1)}><Plus size={12} /></button>}</span></div>
-}
-
-function Zone({ label, cards = [], cardsById, compact, landscape, selected, onSelect }) {
-  return <div className={`play-zone ${compact ? 'compact' : ''} ${landscape ? 'landscape' : ''}`}><small>{label}</small><div>{cards.length ? cards.map((item, index) => { const card = typeof item === 'string' ? cardsById[item] : cardsById[item.cardId]; if (!card) return <span className="face-down-card" key={item.instanceId || index} />; const className = `${selected === item.instanceId ? 'selected' : ''} ${item.exhausted ? 'exhausted' : ''}`; return onSelect ? <button key={item.instanceId || `${card.id}-${index}`} className={className} onClick={() => onSelect(item)}><CardArtwork card={card} /></button> : <span key={item.instanceId || `${card.id}-${index}`} className={`public-card ${className}`}><CardArtwork card={card} /></span> }) : <em>Drop zone</em>}</div></div>
-}
-
 export default function App() {
   const [page, setPage] = useState(() => new URLSearchParams(window.location.search).has('join') ? 'play' : 'discover')
   const [helpOpen, setHelpOpen] = useState(false)
+  const [accountOpen, setAccountOpen] = useState(false)
+  const [accountBusy, setAccountBusy] = useState(false)
+  const [accountError, setAccountError] = useState(null)
+  const [accountSession, setAccountSession] = useState({ signedIn: false, user: null, loading: true })
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [toast, setToast] = useState(null)
   const { cards, loading } = useCards()
   const [decks, setDecksState] = useState(() => loadDecks().map(normalizeDeck))
+  const guestDecksRef = useRef(decks)
+  const deckRevisionRef = useRef(0)
+  const lastSyncedDecksRef = useRef('')
+  const accountGenerationRef = useRef(0)
+  const deckSyncQueueRef = useRef(Promise.resolve())
+  const latestDecksRef = useRef(decks)
+  const accountSessionRef = useRef(accountSession)
+  const unloadFlushFingerprintRef = useRef('')
+
+  latestDecksRef.current = decks
+  accountSessionRef.current = accountSession
+
+  const closeAccount = useCallback(() => setAccountOpen(false), [])
+
+  useEffect(() => {
+    let alive = true
+    async function restoreAccount() {
+      try {
+        const session = await getAccountSession()
+        if (!alive) return
+        if (!session.signedIn) {
+          setAccountSession({ ...session, loading: false })
+          return
+        }
+        const saved = await getAccountDecks()
+        if (!alive) return
+        let accountDecks = saved.decks.map(normalizeDeck)
+        let revision = saved.revision
+        if (!accountDecks.length && guestDecksRef.current.length) {
+          const imported = await replaceAccountDecks(guestDecksRef.current, revision)
+          if (!alive) return
+          accountDecks = imported.decks.map(normalizeDeck)
+          revision = imported.revision
+        }
+        deckRevisionRef.current = revision
+        lastSyncedDecksRef.current = JSON.stringify(accountDecks)
+        accountGenerationRef.current += 1
+        setDecksState(accountDecks)
+        setAccountSession({ ...session, loading: false })
+      } catch (error) {
+        if (!alive) return
+        setAccountError(error)
+        setAccountSession({ signedIn: false, user: null, loading: false, unavailable: true })
+      }
+    }
+    restoreAccount()
+    return () => { alive = false }
+  }, [])
+
+  useEffect(() => {
+    if (!accountSession.signedIn || accountSession.loading) return undefined
+    const fingerprint = JSON.stringify(decks)
+    if (fingerprint === lastSyncedDecksRef.current) return undefined
+    const generation = accountGenerationRef.current
+    const timeout = setTimeout(() => {
+      const snapshot = decks.map(normalizeDeck)
+      deckSyncQueueRef.current = deckSyncQueueRef.current
+        .catch(() => {})
+        .then(async () => {
+          if (generation !== accountGenerationRef.current) return
+          let error = null
+          for (let attempt = 0; attempt <= ACCOUNT_SAVE_RETRY_DELAYS.length; attempt += 1) {
+            try {
+              const saved = await replaceAccountDecks(snapshot, deckRevisionRef.current)
+              if (generation !== accountGenerationRef.current) return
+              deckRevisionRef.current = saved.revision
+              lastSyncedDecksRef.current = JSON.stringify(snapshot)
+              return
+            } catch (caught) {
+              error = caught
+              if (
+                generation !== accountGenerationRef.current
+                || caught.isConflict
+                || !isTransientAccountError(caught)
+                || attempt >= ACCOUNT_SAVE_RETRY_DELAYS.length
+              ) break
+              await delay(ACCOUNT_SAVE_RETRY_DELAYS[attempt])
+            }
+          }
+          if (generation !== accountGenerationRef.current) return
+          if (error?.isConflict) {
+            const latest = await getAccountDecks()
+            if (generation !== accountGenerationRef.current) return
+            const latestDecks = latest.decks.map(normalizeDeck)
+            deckRevisionRef.current = latest.revision
+            lastSyncedDecksRef.current = JSON.stringify(latestDecks)
+            setDecksState(latestDecks)
+            showToast('Decks changed in another window, so the newest saved copy was loaded.', 'error')
+            return
+          }
+          setAccountError(error)
+          showToast(error?.message || 'Could not save decks to this account.', 'error')
+        })
+    }, 450)
+    return () => clearTimeout(timeout)
+  }, [accountSession.loading, accountSession.signedIn, decks])
+
+  useEffect(() => {
+    function flushLatestAccountDecks() {
+      const session = accountSessionRef.current
+      if (!session.signedIn || session.loading) return
+      const snapshot = latestDecksRef.current.map(normalizeDeck)
+      const fingerprint = JSON.stringify(snapshot)
+      if (
+        fingerprint === lastSyncedDecksRef.current
+        || fingerprint === unloadFlushFingerprintRef.current
+      ) return
+      unloadFlushFingerprintRef.current = fingerprint
+      replaceAccountDecks(snapshot, deckRevisionRef.current, { keepalive: true })
+        .then((saved) => {
+          deckRevisionRef.current = saved.revision
+          lastSyncedDecksRef.current = fingerprint
+        })
+        .catch(() => {
+          if (unloadFlushFingerprintRef.current === fingerprint) {
+            unloadFlushFingerprintRef.current = ''
+          }
+        })
+    }
+
+    window.addEventListener('pagehide', flushLatestAccountDecks)
+    window.addEventListener('beforeunload', flushLatestAccountDecks)
+    return () => {
+      window.removeEventListener('pagehide', flushLatestAccountDecks)
+      window.removeEventListener('beforeunload', flushLatestAccountDecks)
+    }
+  }, [])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -775,9 +891,85 @@ export default function App() {
   function setDecks(update) {
     setDecksState((current) => {
       const next = typeof update === 'function' ? update(current) : update
-      saveDecks(next)
+      if (!accountSession.signedIn) {
+        guestDecksRef.current = next
+        saveDecks(next)
+      }
       return next
     })
+  }
+
+  async function finishAccountSignIn(result) {
+    const session = { signedIn: true, user: result.user, loading: false }
+    const saved = await getAccountDecks()
+    let accountDecks = saved.decks.map(normalizeDeck)
+    let revision = saved.revision
+    if (!accountDecks.length && guestDecksRef.current.length) {
+      const imported = await replaceAccountDecks(guestDecksRef.current, revision)
+      accountDecks = imported.decks.map(normalizeDeck)
+      revision = imported.revision
+    }
+    accountGenerationRef.current += 1
+    deckRevisionRef.current = revision
+    lastSyncedDecksRef.current = JSON.stringify(accountDecks)
+    setDecksState(accountDecks)
+    setAccountSession(session)
+    setAccountError(null)
+    showToast(`Signed in as ${result.user.username}.`)
+  }
+
+  async function handleAccountLogin(username, password) {
+    setAccountBusy(true)
+    setAccountError(null)
+    try {
+      await finishAccountSignIn(await loginAccount(username, password))
+    } catch (error) {
+      setAccountError(error)
+      throw error
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  async function handleAccountRegister(username, password) {
+    setAccountBusy(true)
+    setAccountError(null)
+    try {
+      await finishAccountSignIn(await registerAccount(username, password))
+    } catch (error) {
+      setAccountError(error)
+      throw error
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  async function handleAccountLogout() {
+    setAccountBusy(true)
+    setAccountError(null)
+    try {
+      const generation = accountGenerationRef.current
+      const snapshot = decks.map(normalizeDeck)
+      const fingerprint = JSON.stringify(snapshot)
+      deckSyncQueueRef.current = deckSyncQueueRef.current.catch(() => {}).then(async () => {
+        if (generation !== accountGenerationRef.current || fingerprint === lastSyncedDecksRef.current) return
+        const saved = await replaceAccountDecks(snapshot, deckRevisionRef.current)
+        deckRevisionRef.current = saved.revision
+        lastSyncedDecksRef.current = fingerprint
+      })
+      await deckSyncQueueRef.current
+      await logoutAccount()
+      accountGenerationRef.current += 1
+      setAccountSession({ signedIn: false, user: null, loading: false })
+      setDecksState(guestDecksRef.current)
+      closeAccount()
+      showToast('Signed out. Guest decks on this device are active again.')
+    } catch (error) {
+      setAccountError(error)
+      throw error
+    } finally {
+      setAccountBusy(false)
+    }
   }
 
   const pageMeta = {
@@ -789,9 +981,9 @@ export default function App() {
 
   return (
     <div className={`app-shell page-${page}`}>
-      <Sidebar page={page} onPage={setPage} onHelp={() => setHelpOpen(true)} />
+      <Sidebar page={page} onPage={setPage} onHelp={() => setHelpOpen(true)} account={accountSession} onAccount={() => { setAccountError(null); setAccountOpen(true) }} />
       <main className="main-content">
-        <Topbar kicker={pageMeta[0]} title={pageMeta[1]} onMenu={() => setMobileMenuOpen(true)} onHelp={() => setHelpOpen(true)} />
+        <Topbar kicker={pageMeta[0]} title={pageMeta[1]} onMenu={() => setMobileMenuOpen(true)} onHelp={() => setHelpOpen(true)} account={accountSession} onAccount={() => { setAccountError(null); setAccountOpen(true) }} />
         <div className={`page-content ${page === 'decks' ? 'page-content--wide' : ''}`}>
           {page === 'discover' && <DiscoverView cards={cards} loading={loading} onBuild={() => setPage('decks')} />}
           {page === 'decks' && <DecksView cards={cards} decks={decks} setDecks={setDecks} onToast={showToast} />}
@@ -802,7 +994,16 @@ export default function App() {
       <MobileNav page={page} onPage={setPage} />
       <MobileDrawer open={mobileMenuOpen} page={page} onPage={setPage} onHelp={() => setHelpOpen(true)} onClose={() => setMobileMenuOpen(false)} />
       {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
+      {accountOpen && <AccountModal session={accountSession} busy={accountBusy} error={accountError} onLogin={handleAccountLogin} onRegister={handleAccountRegister} onLogout={handleAccountLogout} onClose={closeAccount} />}
       <Toast toast={toast} onClose={() => setToast(null)} />
     </div>
   )
+}
+
+function isTransientAccountError(error) {
+  return error?.status === 0 || error?.status === 429 || error?.status >= 500
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
