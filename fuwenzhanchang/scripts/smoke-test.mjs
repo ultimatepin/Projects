@@ -41,7 +41,10 @@ async function waitForServer(targetOrigin) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     try {
       const response = await fetch(`${targetOrigin}/api/health`)
-      if (response.ok) return
+      if (response.ok) {
+        assert.equal(response.headers.get('content-security-policy'), "frame-ancestors 'none'")
+        return
+      }
     } catch {
       // The server may still be starting; retry until the deadline below.
     }
@@ -137,25 +140,54 @@ try {
   const [hostPlaying, guestPlaying] = await Promise.all([hostPlayingState, guestPlayingState])
 
   const activePlayerId = hostPlaying.game.turn.activePlayerId
-  const activeSocket = activePlayerId === created.playerId ? host : guest
   const activeView = activePlayerId === created.playerId ? hostPlaying : guestPlaying
   const activePlayer = activeView.game.players.find((player) => player.id === activePlayerId)
   assert.equal(activePlayer.zones.runes.length, 2, 'first player channels two Runes')
   assert.equal(activePlayer.zones.hand.count, 5, 'first player draws normally in Duel')
 
-  const energyState = nextState(activeSocket, (state) => state.game?.players.find((player) => player.id === activePlayerId)?.runePool.energy === 1)
-  assert.equal((await emitAck(activeSocket, 'game:action', {
-    type: 'USE_RUNE',
-    payload: { instanceId: activePlayer.zones.runes[0].instanceId, mode: 'energy' },
-  })).ok, true)
-  await energyState
-
   const secondPlayerId = hostPlaying.game.players.find((player) => player.id !== activePlayerId).id
-  const secondTurnState = nextState(host, (state) => state.game?.turn.activePlayerId === secondPlayerId)
-  assert.equal((await emitAck(activeSocket, 'game:action', { type: 'END_TURN', payload: {} })).ok, true)
-  const secondTurn = await secondTurnState
-  const secondPlayer = secondTurn.game.players.find((player) => player.id === secondPlayerId)
-  assert.equal(secondPlayer.zones.runes.length, 3, 'second player channels three Runes on their first turn')
+  const viPlayerId = joined.playerId
+  let currentState = hostPlaying
+  let sawSecondPlayerOpeningTurn = false
+  for (let step = 0; step < 4; step += 1) {
+    const viPlayer = currentState.game.players.find((player) => player.id === viPlayerId)
+    if (currentState.game.turn.activePlayerId === viPlayerId && viPlayer.turnsTaken >= 2) break
+
+    const currentTurn = currentState.game.turn.number
+    const currentPlayerId = currentState.game.turn.activePlayerId
+    const currentSocket = currentPlayerId === created.playerId ? host : guest
+    const followingState = nextState(host, (state) => state.game?.turn.number > currentTurn)
+    assert.equal((await emitAck(currentSocket, 'game:action', { type: 'END_TURN', payload: {} })).ok, true)
+    currentState = await followingState
+
+    if (currentState.game.turn.activePlayerId === secondPlayerId && !sawSecondPlayerOpeningTurn) {
+      const secondPlayer = currentState.game.players.find((player) => player.id === secondPlayerId)
+      assert.equal(secondPlayer.zones.runes.length, 3, 'second player channels three Runes on their first turn')
+      sawSecondPlayerOpeningTurn = true
+    }
+  }
+
+  const viTurnPlayer = currentState.game.players.find((player) => player.id === viPlayerId)
+  assert.equal(currentState.game.turn.activePlayerId, viPlayerId, 'Vi reaches an active second turn')
+  assert.ok(viTurnPlayer.turnsTaken >= 2)
+  assert.ok(viTurnPlayer.zones.runes.length >= 4, 'Vi has enough ready Runes for her printed Energy cost')
+  const viChampion = viTurnPlayer.zones.champion[0]
+  assert.ok(viChampion?.instanceId)
+  const paidPlayState = nextState(host, (state) => state.game?.players
+    .find((player) => player.id === viPlayerId)?.zones.base
+    .some((card) => card.instanceId === viChampion.instanceId))
+  assert.equal((await emitAck(guest, 'game:action', {
+    type: 'PLAY_CARD',
+    payload: {
+      instanceId: viChampion.instanceId,
+      from: 'champion',
+      destination: 'base',
+    },
+  })).ok, true)
+  const afterPaidPlay = await paidPlayState
+  const paidViPlayer = afterPaidPlay.game.players.find((player) => player.id === viPlayerId)
+  assert.equal(paidViPlayer.zones.runes.filter((rune) => rune.exhausted).length, 4)
+  assert.ok(afterPaidPlay.game.history.some((entry) => entry.type === 'PAY_COST'))
 
   const finishedState = nextState(host, (state) => state.status === 'finished')
   const concession = await emitAck(guest, 'game:action', { type: 'CONCEDE', payload: {} })
@@ -168,7 +200,7 @@ try {
   assert.equal(networkInfo.ok, true)
   assert.ok(networkInfo.urls.some((url) => url.endsWith(`:${port}`)))
 
-  console.log('LAN smoke passed: wrong-host diagnosis -> exact precon -> private opening hand -> mulligan -> official Rune turns -> concession')
+  console.log('LAN smoke passed: wrong-host diagnosis -> exact precon -> private opening hand -> mulligan -> official Rune turns -> automatic card payment -> concession')
 } finally {
   host?.disconnect()
   guest?.disconnect()

@@ -62,6 +62,7 @@ app.use((request, response, next) => {
     response.setHeader("Access-Control-Allow-Origin", requestOrigin || "*");
   }
   response.setHeader("Vary", "Origin");
+  response.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Rift-CSRF");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (request.method === "OPTIONS") {

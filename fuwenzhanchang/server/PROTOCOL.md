@@ -1,4 +1,4 @@
-# Rift Local v1.3 protocol
+# Rift Local v1.3.4 protocol
 
 The host server owns room, hidden-card, and official Duel state. Socket mutations
 accept an acknowledgement callback. Success is `{ ok: true, ... }`; failure is
@@ -108,10 +108,11 @@ applying the action twice.
 | --- | --- |
 | `MULLIGAN` / `SUBMIT_MULLIGAN` | `{ instanceIds: [] }`; choose zero to two distinct cards from the viewer's opening hand. |
 | `USE_RUNE` | `{ instanceId, mode: "energy" | "power" }`; `runeId` aliases `instanceId`. |
-| `PLAY_CARD` | `{ instanceId, from?: "champion", destination?: "base" | battlefieldId, spend?: { energy?, powerByDomain? }, permission?: "card-text" }`. The default source is hand and destination is base. |
+| `PLAY_CARD` | `{ instanceId, from?: "champion", destination?: "base" | battlefieldId, spend?: { energy?, powerByDomain? }, permission?: "card-text" }`. The default source is hand and destination is base. The host derives the printed cost and atomically uses the Rune Pool, exhausts ready Runes for Energy, recycles matching Runes for Power, and spends the result. `spend` is a legacy assertion only; when supplied it must exactly match the derived cost. |
 | `STANDARD_MOVE` | `{ unitIds: string[], destination: "base" | battlefieldId, permission?: "ganking" }`; a single `instanceId`/`unitId` is also accepted. |
 | `PASS_FOCUS` | `{}`; only the player holding Focus during a showdown. |
 | `ASSIGN_COMBAT_DAMAGE` | `{ allocations: [{ instanceId, amount }] }`; `targetId` aliases `instanceId`. Attacker assigns first, then defender. |
+| `RESOLVE_PENDING_DECISION` | `{ decisionId, instanceIds: [] }`; only the named deciding player may submit the exact current server-authorized card selection. A single `instanceId` is also accepted. |
 | `APPLY_EFFECT` / `APPLY_MANUAL_EFFECT` | `{ description?, operations: [...] }`; resolves printed card text through the constrained operations below. |
 | `END_MAIN` / `END_TURN` | `{}`; active player only, after showdown/combat is resolved. |
 | `CONCEDE` | `{}`; immediately finishes the game for the opponent. |
@@ -137,10 +138,51 @@ Manual effects contain 1–24 operations. Allowed operation shapes are:
 
 The reducer automates setup, mulligan, turn phases, Channel/Draw/Awaken,
 movement, Focus/showdowns, combat assignment, control, Hold/Conquer scoring,
-Burnout, cleanup, and concessions. Printed card effects are player-declared via
-the constrained manual-operation whitelist rather than interpreted from rules
-text. Resource costs are likewise declared in `PLAY_CARD.spend` and checked
-against the current Rune Pool.
+Burnout, cleanup, concessions, and source-bound card effects that have an
+explicit server implementation. Zaun Warrens is automated: after its controller
+Conquers it, the host places the trigger on the Chain and opens a Focus response
+window. After both players pass, an empty hand draws 1 automatically, a one-card
+hand discards that card and draws 1 automatically, and a larger hand creates a
+private pending choice for exactly one discard before the server draws 1. Its
+trigger still resolves if the final Conquer point was replaced with a draw, and
+victory cleanup waits for both the response window and private choice. A showdown
+opened by a response resolves first; the host then resumes the suspended trigger
+window with its pass count reset and Focus passed from the responding player. All
+other printed card effects are player-declared via the constrained
+manual-operation whitelist rather than inferred from rules text. Normal card
+costs are server-derived. Existing Rune Pool resources are used first; the host
+then selects a deterministic legal exhaust/recycle plan, including exhausting a
+ready matching Rune for Energy before recycling that same Rune for Power when
+useful. An unaffordable, unsupported, or spoofed payment rejects and rolls back
+the entire `PLAY_CARD` action.
+
+While `pendingDecision` is non-null, the server rejects every game action except
+`RESOLVE_PENDING_DECISION` and `CONCEDE`. The resolution must match the current
+decision ID, deciding player, required number of distinct cards, and the eligible
+zone/instance IDs captured by the server. A failed resolution rolls the entire
+action back. The deciding player receives a source-bound shape such as:
+
+```js
+{
+  id,
+  kind: "card-selection",
+  playerId,
+  source: { cardId, battlefieldId, trigger: "conquer" },
+  prompt,
+  selection: {
+    operation: "discard",
+    ownerPlayerId: playerId,
+    zones: ["hand"],
+    count: 1,
+    fulfillment: "as-many-as-possible",
+    eligibleInstanceIds: [/* private instance IDs */]
+  },
+  continuation: [{ operation: "draw", playerId, count: 1 }]
+}
+```
+
+Other viewers receive only `{ playerId, kind }`, never the decision ID or private
+eligible-card list.
 
 The victory score is 8. Hold can supply the final point; a final point from
 Conquer requires the player to have scored every Battlefield that turn,

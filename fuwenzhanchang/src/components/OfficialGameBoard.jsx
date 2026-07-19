@@ -1,4 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+
+import { planRunePayment, RUNE_DOMAINS } from '../../server/runePayment.js'
 
 const EFFECT_OPERATIONS = [
   ['draw', 'Draw cards'],
@@ -21,7 +23,7 @@ const EFFECT_OPERATIONS = [
 ]
 const PLAYER_EFFECT_OPERATIONS = new Set(['draw', 'channel', 'gain_points', 'gain_xp', 'spend_xp', 'create_token'])
 const AMOUNT_EFFECT_OPERATIONS = new Set(['draw', 'damage', 'heal', 'channel', 'gain_points', 'gain_xp', 'spend_xp', 'create_token'])
-const DOMAINS = ['fury', 'calm', 'mind', 'body', 'chaos', 'order']
+const DOMAINS = RUNE_DOMAINS
 
 function asArray(value) {
   return Array.isArray(value) ? value : []
@@ -77,21 +79,39 @@ function isOfficialTokenCard(card) {
   return originToken || tokenVariant
 }
 
-function cardImage(card) {
+function cardImage(card, large = false) {
+  if (large) {
+    return card?.image_thumb?.large
+      || card?.image
+      || card?.image_thumb?.medium
+      || card?.image_thumb?.small
+      || ''
+  }
   return card?.image_thumb?.medium
     || card?.image_thumb?.small
     || card?.image
     || ''
 }
 
-function normalCardSpend(card) {
-  const energy = Math.max(0, Math.trunc(Number(card?.stats?.energy ?? card?.energy) || 0))
-  const power = Math.max(0, Math.trunc(Number(card?.stats?.power ?? card?.power) || 0))
-  const domain = String(card?.faction || '').trim().toLowerCase()
-  return {
-    energy,
-    powerByDomain: power > 0 && DOMAINS.includes(domain) ? { [domain]: power } : {},
-  }
+function titleCase(value) {
+  const text = String(value || '').trim()
+  return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : ''
+}
+
+function cardStatSummary(card) {
+  if (!card) return ''
+  const stats = card.stats || {}
+  const parts = [titleCase(card.type)]
+  const rawEnergy = stats.energy ?? card.energy
+  const rawPower = stats.power ?? card.power
+  const rawMight = stats.might ?? card.might
+  const energy = Number(rawEnergy)
+  const power = Number(rawPower)
+  const might = Number(rawMight)
+  if (rawEnergy !== null && rawEnergy !== undefined && Number.isFinite(energy)) parts.push(`${energy} Energy`)
+  if (rawPower !== null && rawPower !== undefined && Number.isFinite(power) && power > 0) parts.push(`${power} Power`)
+  if (rawMight !== null && rawMight !== undefined && Number.isFinite(might)) parts.push(`${might} Might`)
+  return parts.filter(Boolean).join(' · ')
 }
 
 function currentUnitMight(cardsById, instance) {
@@ -127,15 +147,21 @@ function actionId() {
   return `action-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
 }
 
+function focusCardInstance(instanceId) {
+  const card = Array.from(globalThis.document?.querySelectorAll?.('[data-card-instance]') || [])
+    .find((element) => element.dataset.cardInstance === instanceId)
+  card?.focus({ preventScroll: true })
+}
+
 function ackMessage(response) {
   if (typeof response?.error === 'string') return response.error
   return response?.error?.message || response?.message || 'The host rejected that action.'
 }
 
-function OfficialCardArt({ card, hidden = false }) {
-  const image = !hidden && cardImage(card)
+function OfficialCardArt({ card, hidden = false, large = false }) {
+  const image = !hidden && cardImage(card, large)
   return (
-    <span className={`official-game__art ${hidden ? 'official-game__art--hidden' : ''}`}>
+    <span className={`official-game__art ${hidden ? 'official-game__art--hidden' : ''} ${large ? 'official-game__art--large' : ''}`}>
       {image && <img src={image} alt={card?.name || 'Riftbound card'} onError={(event) => { event.currentTarget.hidden = true }} />}
       <span className="official-game__art-fallback">{hidden ? 'RIFTBOUND' : card?.name || 'Unknown card'}</span>
     </span>
@@ -152,6 +178,8 @@ function InstanceCard({
   onSelect,
   label,
   compact = false,
+  hand = false,
+  prompted = false,
 }) {
   const instance = normalizedInstance(value, index, prefix)
   const card = cardLookup(cardsById, instance.cardId)
@@ -159,6 +187,8 @@ function InstanceCard({
   const classes = [
     'official-game__instance',
     compact ? 'official-game__instance--compact' : '',
+    hand ? 'official-game__instance--hand' : '',
+    prompted ? 'official-game__instance--prompted' : '',
     instance.exhausted ? 'official-game__instance--exhausted' : '',
     selected === instance.instanceId ? 'official-game__instance--selected' : '',
     hidden ? 'official-game__instance--hidden' : '',
@@ -166,7 +196,8 @@ function InstanceCard({
   const content = (
     <>
       <OfficialCardArt card={card} hidden={hidden} />
-      <span className="official-game__instance-name">{hidden ? 'Face-down card' : card?.name || instance.cardId || 'Unknown card'}</span>
+      {!hand && <span className="official-game__instance-name">{hidden ? 'Face-down card' : card?.name || instance.cardId || 'Unknown card'}</span>}
+      {!hand && !hidden && cardStatSummary(card) && <span className="official-game__instance-meta">{cardStatSummary(card)}</span>}
       {(Number(instance.damage) > 0 || Number(instance.buff) !== 0) && (
         <span className="official-game__instance-counters">
           {Number(instance.damage) > 0 && <b>Damage {instance.damage}</b>}
@@ -180,8 +211,16 @@ function InstanceCard({
     <button
       type="button"
       className={classes}
+      data-card-instance={instance.instanceId}
       aria-pressed={selected === instance.instanceId}
-      aria-label={label || `Select ${card?.name || 'card'}`}
+      aria-label={label || (prompted
+        ? `Discard ${card?.name || 'card'} for the pending effect`
+        : `${selected === instance.instanceId ? 'Deselect' : 'Select'} ${card?.name || 'card'}`)}
+      title={prompted
+        ? `Discard ${card?.name || 'card'}, then draw 1 automatically`
+        : selected === instance.instanceId
+          ? 'Selected — actions are open'
+          : `Select ${card?.name || 'card'} to open its actions`}
       onClick={() => onSelect?.(instance)}
     >
       {content}
@@ -202,7 +241,7 @@ function CardZone({
 }) {
   const data = zoneData(zone)
   return (
-    <section className={`official-game__zone ${compact ? 'official-game__zone--compact' : ''}`}>
+    <section className={`official-game__zone ${compact ? 'official-game__zone--compact' : ''} ${data.cards.length < 1 ? 'official-game__zone--empty' : ''}`}>
       <header className="official-game__zone-title"><strong>{title}</strong><span>{data.count}</span></header>
       <div className="official-game__zone-cards">
         {data.cards.length > 0
@@ -247,16 +286,15 @@ function IdentityCard({ title, zone, cardsById, selected, selectable, onSelect, 
   )
 }
 
-function RunePool({ player, cardsById, canAct, pending, onUseRune }) {
+function RunePool({ player, cardsById }) {
   const runeZone = zoneData(player?.zones?.runes)
   const pool = player?.runePool || {}
   const power = pool.powerByDomain && typeof pool.powerByDomain === 'object' ? pool.powerByDomain : {}
   return (
     <section className="official-game__runes">
       <header className="official-game__rune-summary">
-        <strong>Runes & resources</strong>
+        <strong>Resources</strong>
         <span>Energy {Number(pool.energy) || 0}</span>
-        <span>Rune deck {zoneData(player?.zones?.runeDeck).count}</span>
       </header>
       <div className="official-game__power-list">
         {DOMAINS.map((domain) => <span key={domain}>{domain} {Number(power[domain]) || 0}</span>)}
@@ -266,13 +304,14 @@ function RunePool({ player, cardsById, canAct, pending, onUseRune }) {
           const instance = normalizedInstance(value, index, `rune-${player?.id}`)
           const card = cardLookup(cardsById, instance.cardId)
           return (
-            <article className={`official-game__rune ${instance.exhausted ? 'official-game__rune--exhausted' : ''}`} key={instance._key}>
+            <article
+              className={`official-game__rune ${instance.exhausted ? 'official-game__rune--exhausted' : ''}`}
+              key={instance._key}
+              title={`${card?.name || 'Rune'} · ${instance.exhausted ? 'Exhausted' : 'Ready'}${card?.faction ? ` · ${titleCase(card.faction)}` : ''}`}
+            >
               <OfficialCardArt card={card} hidden={instance.faceDown} />
               <strong>{card?.name || 'Rune'}</strong>
-              <div className="official-game__rune-actions">
-                <button type="button" disabled={!canAct || Boolean(pending) || instance.exhausted} onClick={() => onUseRune(instance.instanceId, 'energy')}>Energy</button>
-                <button type="button" disabled={!canAct || Boolean(pending)} onClick={() => onUseRune(instance.instanceId, 'power')}>Power</button>
-              </div>
+              <small>{instance.exhausted ? 'Exhausted' : 'Ready'}{card?.faction ? ` · ${titleCase(card.faction)}` : ''}</small>
             </article>
           )
         }) : <span className="official-game__empty">No runes in play</span>}
@@ -281,7 +320,7 @@ function RunePool({ player, cardsById, canAct, pending, onUseRune }) {
   )
 }
 
-function PlayerSummary({ player, self, cardsById, selected, canAct, pending, onSelect, onUseRune }) {
+function PlayerSummary({ player, self, cardsById, selected, onSelect, interactionLocked = false }) {
   const zones = player?.zones || {}
   return (
     <section className={`official-game__player ${self ? 'official-game__player--self' : 'official-game__player--opponent'}`}>
@@ -299,7 +338,7 @@ function PlayerSummary({ player, self, cardsById, selected, canAct, pending, onS
           cardsById={cardsById}
           prefix={`champion-${player?.id}`}
           selected={selected}
-          selectable={self}
+          selectable={self && !interactionLocked}
           onSelect={(instance) => onSelect?.(instance, 'champion')}
         />
         <div className="official-game__private-counts">
@@ -309,12 +348,15 @@ function PlayerSummary({ player, self, cardsById, selected, canAct, pending, onS
           <span><b>{zoneData(zones.banishment).count}</b> Banished</span>
         </div>
       </div>
-      <RunePool player={player} cardsById={cardsById} canAct={self && canAct} pending={pending} onUseRune={onUseRune} />
+      <RunePool
+        player={player}
+        cardsById={cardsById}
+      />
     </section>
   )
 }
 
-function Battlefield({ battlefield, index, players, selfId, cardsById, selected, onSelect }) {
+function Battlefield({ battlefield, index, players, selfId, cardsById, selected, onSelect, interactionLocked = false }) {
   const field = battlefield || { instanceId: `missing-battlefield-${index}` }
   const card = cardLookup(cardsById, field.cardId)
   const units = battlefieldUnits(field)
@@ -331,7 +373,7 @@ function Battlefield({ battlefield, index, players, selfId, cardsById, selected,
         </small>
       </header>
       <OfficialCardArt card={card} hidden={!field.cardId} />
-      <div className="official-game__battlefield-units">
+      <div className={`official-game__battlefield-units ${units.length < 1 ? 'official-game__battlefield-units--empty' : ''}`}>
         {units.length > 0 ? units.map((value, unitIndex) => {
           const instance = normalizedInstance(value, unitIndex, `field-${field.instanceId}`)
           const own = (instance.controllerPlayerId || instance.ownerPlayerId || field.controllerPlayerId) === selfId
@@ -343,7 +385,7 @@ function Battlefield({ battlefield, index, players, selfId, cardsById, selected,
               prefix={`field-${field.instanceId}`}
               cardsById={cardsById}
               selected={selected}
-              selectable={own}
+              selectable={own && !interactionLocked}
               onSelect={(chosen) => onSelect?.(chosen, 'battlefield', field.instanceId)}
               compact
             />
@@ -358,6 +400,16 @@ function logText(entry) {
   if (typeof entry === 'string') return entry
   if (!entry || typeof entry !== 'object') return String(entry || '')
   return entry.message || entry.summary || entry.description || JSON.stringify(entry)
+}
+
+function handGridStyle(count) {
+  const total = Math.max(1, Number(count) || 0)
+  return {
+    '--hand-columns-wide': total <= 8 ? total : Math.ceil(total / 2),
+    '--hand-columns-medium': total <= 6 ? total : Math.ceil(total / 2),
+    '--hand-columns-compact': Math.min(3, total),
+    '--hand-columns-small': Math.min(2, total),
+  }
 }
 
 export default function OfficialGameBoard({
@@ -383,7 +435,9 @@ export default function OfficialGameBoard({
   const [mulliganIds, setMulliganIds] = useState([])
   const [pending, setPending] = useState('')
   const [localError, setLocalError] = useState('')
-  const [damageTarget, setDamageTarget] = useState('')
+  const [damageOrder, setDamageOrder] = useState([])
+  const actionDockRef = useRef(null)
+  const primaryActionRef = useRef(null)
   const [effect, setEffect] = useState({
     description: '',
     operation: 'draw',
@@ -395,15 +449,108 @@ export default function OfficialGameBoard({
     tokenExhausted: true,
   })
 
+  // Keep the selection tied to the latest server snapshot. A card can be
+  // exhausted, moved, discarded, or destroyed while it remains selected.
+  const activeSelection = (() => {
+    if (!selected || !self) return null
+    let values = []
+    if (['hand', 'champion', 'base'].includes(selected.zone)) {
+      values = zoneData(self.zones?.[selected.zone]).cards
+    } else if (selected.zone === 'battlefield') {
+      const field = battlefields.find((candidate) => candidate?.instanceId === selected.battlefieldId)
+      values = battlefieldUnits(field)
+    }
+    const current = values
+      .map((value, index) => normalizedInstance(value, index, `selected-${selected.zone}`))
+      .find((instance) => instance.instanceId === selected.instanceId)
+    return current ? { ...current, zone: selected.zone, battlefieldId: selected.battlefieldId || null } : null
+  })()
+  const staleSelectionId = selected?.instanceId && !activeSelection ? selected.instanceId : ''
+
+  useEffect(() => {
+    const selectedInstanceId = activeSelection?.instanceId
+    if (!selectedInstanceId) return undefined
+
+    const focusTimer = globalThis.setTimeout(() => {
+      const primaryAction = primaryActionRef.current
+      const focusTarget = primaryAction && !primaryAction.disabled ? primaryAction : actionDockRef.current
+      focusTarget?.focus({ preventScroll: true })
+    }, 0)
+    const dismissWithKeyboard = (event) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setSelected(null)
+      globalThis.setTimeout(() => focusCardInstance(selectedInstanceId), 0)
+    }
+    globalThis.document?.addEventListener?.('keydown', dismissWithKeyboard)
+    return () => {
+      globalThis.clearTimeout(focusTimer)
+      globalThis.document?.removeEventListener?.('keydown', dismissWithKeyboard)
+    }
+  }, [activeSelection?.instanceId])
+
+  useEffect(() => {
+    if (!staleSelectionId) return undefined
+    const fallback = globalThis.document?.querySelector?.(
+      '.official-game__priority-actions button:not(:disabled), .official-game__hand .official-game__instance, .official-game__topbar button',
+    )
+    fallback?.focus({ preventScroll: true })
+    setSelected(null)
+    return undefined
+  }, [staleSelectionId])
+
   const status = game?.status || 'loading'
   const phase = String(turn.phase || turn.state || '').toLowerCase()
+  const turnState = String(turn.state || '').toLowerCase()
   const activePlayerId = turn.activePlayerId
   const focusPlayerId = turn.focusPlayerId
+  const showdownOpen = Boolean(game?.showdown)
+  const triggeredEffectOpen = game?.showdown?.type === 'triggered-effect'
+  const cardDecision = game?.pendingDecision && typeof game.pendingDecision === 'object'
+    ? game.pendingDecision
+    : null
+  const ownCardDecision = cardDecision?.playerId === selfId && Boolean(cardDecision?.id)
+    ? cardDecision
+    : null
+  const decisionEligibleIds = asArray(ownCardDecision?.selection?.eligibleInstanceIds)
+  const firstDecisionEligibleId = decisionEligibleIds[0] || ''
+
+  useEffect(() => {
+    if (!ownCardDecision?.id || !firstDecisionEligibleId) return undefined
+    const focusTimer = globalThis.setTimeout(() => focusCardInstance(firstDecisionEligibleId), 0)
+    return () => globalThis.clearTimeout(focusTimer)
+  }, [ownCardDecision?.id, firstDecisionEligibleId])
+
   const hasFocus = !focusPlayerId ? activePlayerId === selfId : focusPlayerId === selfId
   const awaitingCombatAssignment = ['assign-attacker', 'assign-defender'].includes(String(game?.combat?.stage || '').toLowerCase())
-  const canTakeAction = Boolean(connected && status === 'playing' && hasFocus && !pending && !awaitingCombatAssignment)
+  const canTakeAction = Boolean(connected && status === 'playing' && hasFocus && !pending && !cardDecision && !awaitingCombatAssignment)
   const canTakeTurnAction = Boolean(canTakeAction && activePlayerId === selfId)
+  const canStandardMove = Boolean(canTakeTurnAction && phase === 'main' && turnState === 'neutral-open' && !showdownOpen && !game?.combat)
+  const canPassFocus = Boolean(canTakeAction && showdownOpen && focusPlayerId === selfId)
+  const canEndTurn = Boolean(connected && status === 'playing' && activePlayerId === selfId && phase === 'main' && !pending && !cardDecision && !showdownOpen && !game?.combat)
   const displayedError = error || localError
+  const actionDisabledReason = !connected
+    ? 'Reconnect to the host before acting.'
+    : pending
+      ? `Wait for ${pending.replaceAll('_', ' ').toLowerCase()} to finish.`
+      : cardDecision
+        ? (ownCardDecision
+            ? 'Choose one highlighted hand card to discard for the pending effect.'
+            : `Waiting for ${playerName(players, cardDecision.playerId, 'the other player')} to resolve a private card choice.`)
+      : status !== 'playing'
+        ? 'Complete the opening setup first.'
+        : awaitingCombatAssignment
+          ? 'Combat damage must be assigned before taking another action.'
+          : !hasFocus
+            ? `Waiting for ${playerName(players, focusPlayerId || activePlayerId, 'the other player')}.`
+            : ''
+  const standardMoveDisabledReason = !canTakeAction
+    ? actionDisabledReason
+    : activePlayerId !== selfId
+      ? 'Standard Move is available only during your own turn.'
+      : phase !== 'main' || turnState !== 'neutral-open' || showdownOpen || game?.combat
+        ? 'Standard Move is available only in your open Main Phase, outside a showdown.'
+        : ''
 
   function reportError(message) {
     setLocalError(message)
@@ -451,14 +598,22 @@ export default function OfficialGameBoard({
     if (!selfId) return
     const ownerId = instance.controllerPlayerId || instance.ownerPlayerId || selfId
     if (ownerId !== selfId) return
-    if (['base', 'battlefield'].includes(zone)) {
-      const card = cardLookup(cardsById, instance.cardId)
-      if (String(card?.type || '').toLowerCase() !== 'unit') {
-        reportError('Only Units can use a Standard Move.')
-        return
+    if (cardDecision) {
+      if (
+        zone === 'hand'
+        && ownCardDecision
+        && decisionEligibleIds.includes(instance.instanceId)
+      ) {
+        sendAction('RESOLVE_PENDING_DECISION', {
+          decisionId: ownCardDecision.id,
+          instanceIds: [instance.instanceId],
+        }, () => setSelected(null))
       }
+      return
     }
     setSelected((current) => current?.instanceId === instance.instanceId
+      && current.zone === zone
+      && (current.battlefieldId || null) === (battlefieldId || null)
       ? null
       : { ...instance, zone, battlefieldId })
   }
@@ -478,27 +633,27 @@ export default function OfficialGameBoard({
   }
 
   function playSelected(destination) {
-    if (!selected || !['hand', 'champion'].includes(selected.zone)) return
-    const card = cardLookup(cardsById, selected.cardId)
-    const spend = normalCardSpend(card)
-    if ((Number(card?.stats?.power ?? card?.power) || 0) > 0 && Object.keys(spend.powerByDomain).length === 0) {
-      reportError('This card has a Power cost but no supported domain. Resolve its cost before playing it.')
-      return
-    }
+    if (!activeSelection || !['hand', 'champion'].includes(activeSelection.zone)) return
     sendAction('PLAY_CARD', {
-      instanceId: selected.instanceId,
-      from: selected.zone,
+      instanceId: activeSelection.instanceId,
+      from: activeSelection.zone,
       destination,
-      spend,
     }, () => setSelected(null))
   }
 
   function moveSelected(destination) {
-    if (!selected || !['base', 'battlefield'].includes(selected.zone)) return
+    if (!activeSelection || !['base', 'battlefield'].includes(activeSelection.zone)) return
+    if (String(cardLookup(cardsById, activeSelection.cardId)?.type || '').toLowerCase() !== 'unit') return
     sendAction('STANDARD_MOVE', {
-      unitIds: [selected.instanceId],
+      unitIds: [activeSelection.instanceId],
       destination,
     }, () => setSelected(null))
+  }
+
+  function dismissSelection() {
+    const selectedInstanceId = activeSelection?.instanceId
+    setSelected(null)
+    if (selectedInstanceId) globalThis.setTimeout(() => focusCardInstance(selectedInstanceId), 0)
   }
 
   if (!game) {
@@ -520,25 +675,34 @@ export default function OfficialGameBoard({
   const opposingCombatUnits = battlefieldUnits(combatBattlefield)
     .map((value, index) => normalizedInstance(value, index, 'combat'))
     .filter((instance) => (instance.controllerPlayerId || instance.ownerPlayerId) !== selfId)
-  const legalDamageTarget = opposingCombatUnits.some((instance) => instance.instanceId === damageTarget)
-    ? damageTarget
-    : opposingCombatUnits[0]?.instanceId || ''
+  const combatTargetIds = opposingCombatUnits.map((instance) => instance.instanceId)
+  const legalDamageOrder = [
+    ...damageOrder.filter((instanceId) => combatTargetIds.includes(instanceId)),
+    ...combatTargetIds.filter((instanceId) => !damageOrder.includes(instanceId)),
+  ]
   const mightTotals = combat?.mightTotals && typeof combat.mightTotals === 'object' ? combat.mightTotals : {}
   const combatRole = combatAttackerId === selfId ? 'attacker' : combatDefenderId === selfId ? 'defender' : ''
   const ownCombatMight = Math.max(0, Number(mightTotals[selfId] ?? mightTotals[combatRole]) || 0)
-  const orderedCombatTargets = legalDamageTarget
-    ? [
-        opposingCombatUnits.find((instance) => instance.instanceId === legalDamageTarget),
-        ...opposingCombatUnits.filter((instance) => instance.instanceId !== legalDamageTarget),
-      ].filter(Boolean)
-    : opposingCombatUnits
+  const orderedCombatTargets = legalDamageOrder
+    .map((instanceId) => opposingCombatUnits.find((instance) => instance.instanceId === instanceId))
+    .filter(Boolean)
   const combatAllocations = defaultCombatAllocations(cardsById, orderedCombatTargets, ownCombatMight)
   const expectedDamagePlayerId = combat?.stage === 'assign-attacker'
     ? combatAttackerId
     : combat?.stage === 'assign-defender'
       ? combatDefenderId
       : null
-  const canAssignCombat = Boolean(connected && status === 'playing' && !pending && expectedDamagePlayerId === selfId)
+  const canAssignCombat = Boolean(connected && status === 'playing' && !pending && !cardDecision && expectedDamagePlayerId === selfId)
+
+  function moveCombatTarget(instanceId, direction) {
+    const currentOrder = [...legalDamageOrder]
+    const currentIndex = currentOrder.indexOf(instanceId)
+    const nextIndex = currentIndex + direction
+    if (currentIndex < 0 || nextIndex < 0 || nextIndex >= currentOrder.length) return
+    const [moved] = currentOrder.splice(currentIndex, 1)
+    currentOrder.splice(nextIndex, 0, moved)
+    setDamageOrder(currentOrder)
+  }
 
   const effectInstances = []
   for (const player of players) {
@@ -698,17 +862,224 @@ export default function OfficialGameBoard({
     })
   }
 
-  const rulesVersion = typeof game.rules === 'string'
-    ? game.rules
-    : game.rules?.version || game.rules?.coreVersion || game.rules?.ruleVersion || 'server-defined'
   const history = asArray(game.history || game.log).slice(-10)
   const winner = players.find((player) => player.id === game.winnerPlayerId)
-  const selectedCard = cardLookup(cardsById, selected?.cardId)
-  const selectedSpend = normalCardSpend(selectedCard)
-  const selectedPowerEntry = Object.entries(selectedSpend.powerByDomain)[0]
+  const decisionSourceName = cardLookup(cardsById, ownCardDecision?.source?.cardId)?.name || 'Card effect'
+  const selectedCard = cardLookup(cardsById, activeSelection?.cardId)
+  const selectedType = String(selectedCard?.type || '').toLowerCase()
+  const selectedIsPlayable = ['unit', 'gear', 'spell'].includes(selectedType)
+  const selectionFromHand = ['hand', 'champion'].includes(activeSelection?.zone)
+  const selfRunePool = self?.runePool || {}
+  const selectedPaymentPlan = planRunePayment({
+    card: selectedCard,
+    runePool: selfRunePool,
+    runes: zoneData(self?.zones?.runes).cards,
+    cardsById,
+  })
+  const canPlaySelected = Boolean(canTakeAction && selectedIsPlayable && selectedPaymentPlan.affordable)
+  const playDisabledReason = actionDisabledReason
+    || (!selectedIsPlayable ? 'Only Units, Gear, and Spells can be played this way.' : '')
+    || (!selectedPaymentPlan.affordable ? selectedPaymentPlan.summaries.shortage : '')
+  const selectedIsBoardUnit = selectedType === 'unit'
+  const canMoveSelected = Boolean(canStandardMove && activeSelection && selectedIsBoardUnit && !activeSelection.exhausted)
+  const moveDisabledReason = !selectedIsBoardUnit
+    ? 'Only Units can use a Standard Move. This card is selected for inspection.'
+    : standardMoveDisabledReason
+      || (activeSelection?.exhausted ? 'This Unit is exhausted and cannot pay the Standard Move cost.' : '')
+  const effectSubmitReason = actionDisabledReason
+    || (!effect.description.trim() ? 'Enter the card name and printed effect first.' : '')
+    || (!legalEffectTarget ? 'Choose a legal target.' : '')
+    || (['move', 'create_token'].includes(effect.operation) && !legalEffectDestination ? 'Choose a legal destination.' : '')
+    || (effect.operation === 'create_token' && !legalTokenCardId ? 'Choose an official token.' : '')
+  const actionDockMode = selectionFromHand ? 'play' : selectedIsBoardUnit ? 'move' : 'inspect'
+  const actionDockBlocked = selectionFromHand
+    ? !canPlaySelected
+    : selectedIsBoardUnit
+      ? !canMoveSelected
+      : false
+  const standardMoveDestinations = selectedIsBoardUnit && activeSelection?.zone === 'battlefield'
+    ? [{ value: 'base', label: 'Your base', context: 'Return this Unit to your base' }]
+    : selectedIsBoardUnit && activeSelection?.zone === 'base'
+      ? battlefields.filter(Boolean).map((field, index) => {
+          const label = cardLookup(cardsById, field.cardId)?.name || `Battlefield ${index + 1}`
+          const controller = field.controllerPlayerId
+            ? (field.controllerPlayerId === selfId ? 'You control it' : `${playerName(players, field.controllerPlayerId)} controls it`)
+            : 'Uncontrolled'
+          const contested = field.contestedByPlayerId
+            ? ` · contested by ${playerName(players, field.contestedByPlayerId)}`
+            : ''
+          return { value: field.instanceId, label, context: `${controller}${contested}` }
+        })
+      : []
+  const selectedCostText = selectedPaymentPlan.summaries.cost
+  const selectedPoolParts = [
+    selectedPaymentPlan.fromPool.energy
+      ? `${selectedPaymentPlan.fromPool.energy} Energy`
+      : '',
+    ...Object.entries(selectedPaymentPlan.fromPool.powerByDomain)
+      .filter(([, amount]) => Number(amount) > 0)
+      .map(([domain, amount]) => `${amount} ${titleCase(domain)} Power`),
+  ].filter(Boolean)
+  const selectedActivatesRunes = selectedPaymentPlan.exhaustIds.length > 0
+    || selectedPaymentPlan.recycleIds.length > 0
+  const selectedHasCost = selectedPaymentPlan.cost.energy > 0
+    || Object.values(selectedPaymentPlan.cost.powerByDomain).some((amount) => Number(amount) > 0)
+    || Object.values(selectedPaymentPlan.cost.unsupportedPowerByDomain).some((amount) => Number(amount) > 0)
+  const selectedPaymentText = [
+    selectedPoolParts.length ? `Use ${selectedPoolParts.join(' + ')} already in the pool` : '',
+    selectedActivatesRunes ? selectedPaymentPlan.summaries.payment : '',
+  ].filter(Boolean).join('; ')
+  const actionDockStatusTone = actionDockBlocked ? 'blocked' : actionDockMode === 'inspect' ? 'info' : 'ready'
+  const actionDockStatusTitle = selectionFromHand
+    ? (canPlaySelected
+        ? (selectedHasCost ? `Auto-pay ready · ${selectedCostText}` : 'Ready · no Rune payment')
+        : 'Not ready to play')
+    : selectedIsBoardUnit
+      ? (canMoveSelected ? 'Ready for a Standard Move' : 'Standard Move unavailable')
+      : 'Inspect this card'
+  const actionDockStatusCopy = selectionFromHand
+    ? (playDisabledReason || `${selectedHasCost ? `Auto-pay: ${selectedPaymentText}. ` : ''}Choose a destination below.`)
+    : selectedIsBoardUnit
+      ? (moveDisabledReason || 'Choose a destination below. This Unit exhausts to pay the move cost.')
+      : 'Gear cannot use a Standard Move. Resolve its printed text with your opponent when relevant.'
+
+  let nextAction = {
+    tone: 'waiting',
+    kicker: 'Next action',
+    title: 'Waiting for the game state',
+    copy: 'The host is preparing the next step.',
+    steps: [],
+  }
+  if (!connected) {
+    nextAction = {
+      tone: 'blocked',
+      kicker: 'Connection interrupted',
+      title: 'Reconnecting to the host',
+      copy: 'Keep this page open. Actions will return when the local connection is restored.',
+      steps: [],
+    }
+  } else if (status === 'finished') {
+    nextAction = {
+      tone: game.winnerPlayerId === selfId ? 'ready' : 'waiting',
+      kicker: 'Game complete',
+      title: game.winnerPlayerId === selfId ? 'You won the match' : `${winner?.name || 'Your opponent'} won the match`,
+      copy: 'Review the final score and game log, or leave the table when ready.',
+      steps: [],
+    }
+  } else if (status === 'mulligan') {
+    nextAction = self?.mulliganSubmitted
+      ? {
+          tone: 'waiting',
+          kicker: 'Opening hand locked',
+          title: opponent?.mulliganSubmitted ? 'Both players are ready' : `Waiting for ${opponent?.name || 'your opponent'}`,
+          copy: 'Your mulligan choice has been submitted and cannot be changed.',
+          steps: [],
+        }
+      : {
+          tone: 'ready',
+          kicker: 'Your opening choice',
+          title: mulliganIds.length ? `Replace ${mulliganIds.length} selected card${mulliganIds.length === 1 ? '' : 's'}` : 'Keep all four, or replace up to two',
+          copy: 'Select unwanted cards, then confirm your opening hand.',
+          steps: ['Select 0–2 cards', 'Confirm once', 'Wait for your opponent'],
+        }
+  } else if (pending) {
+    nextAction = {
+      tone: 'waiting',
+      kicker: 'Action sent',
+      title: `Applying ${pending.replaceAll('_', ' ').toLowerCase()}`,
+      copy: 'Wait for the host to confirm before choosing another action.',
+      steps: [],
+    }
+  } else if (cardDecision) {
+    nextAction = ownCardDecision
+      ? {
+          tone: 'combat',
+          kicker: `${decisionSourceName} · required effect`,
+          title: 'Choose one hand card to discard',
+          copy: 'Select one highlighted card below. The host discards it and draws 1 automatically.',
+          steps: [],
+        }
+      : {
+          tone: 'waiting',
+          kicker: 'Private card choice',
+          title: `Waiting for ${playerName(players, cardDecision.playerId, 'the other player')}`,
+          copy: 'Their legal choice is private. The host will continue the effect automatically.',
+          steps: [],
+        }
+  } else if (expectedDamagePlayerId) {
+    nextAction = expectedDamagePlayerId === selfId
+      ? {
+          tone: 'combat',
+          kicker: 'Your combat decision',
+          title: `Assign ${ownCombatMight} combat damage`,
+          copy: ownCombatMight > 0
+            ? 'Choose the first opposing Unit to receive damage, review the allocation, then confirm.'
+            : 'You have no Might to assign. Confirm zero damage to continue combat.',
+          steps: ['Choose first target', 'Review all damage', 'Confirm assignment'],
+        }
+      : {
+          tone: 'waiting',
+          kicker: 'Combat in progress',
+          title: `Waiting for ${playerName(players, expectedDamagePlayerId)}`,
+          copy: 'The other player must assign combat damage before the game can continue.',
+          steps: [],
+        }
+  } else if (status === 'playing' && !hasFocus) {
+    nextAction = {
+      tone: 'waiting',
+      kicker: showdownOpen ? 'Showdown response window' : 'Opponent’s turn',
+      title: `Waiting for ${playerName(players, focusPlayerId || activePlayerId, 'your opponent')}`,
+      copy: showdownOpen
+        ? (triggeredEffectOpen
+            ? 'Zaun Warrens is on the Chain. They may respond or pass Focus; its discard/draw resolves after both players pass.'
+            : 'They have Focus. Watch for their response; you will be prompted when Focus returns to you.')
+        : 'You can inspect cards and the game log while they take their turn.',
+      steps: [],
+    }
+  } else if (status === 'playing' && activeSelection) {
+    const selectedName = selectedCard?.name || 'selected card'
+    const selectedFromHand = ['hand', 'champion'].includes(activeSelection.zone)
+    nextAction = {
+      tone: selectedFromHand
+        ? (canPlaySelected ? 'ready' : 'blocked')
+        : selectedIsBoardUnit
+          ? (canMoveSelected ? 'ready' : 'blocked')
+          : 'waiting',
+      kicker: `${titleCase(activeSelection.zone)} selected`,
+      title: selectedFromHand
+        ? `Choose how to play ${selectedName}`
+        : selectedIsBoardUnit
+          ? `Choose where to move ${selectedName}`
+          : `Inspect ${selectedName}`,
+      copy: selectedFromHand
+        ? (playDisabledReason || 'Review its normal cost and choose one legal destination below.')
+        : selectedIsBoardUnit
+          ? (moveDisabledReason || 'Choose one legal Standard Move destination below.')
+          : 'Read the enlarged card. Gear remains at base unless a printed effect changes it.',
+      steps: [],
+    }
+  } else if (canPassFocus) {
+    nextAction = {
+      tone: 'combat',
+      kicker: triggeredEffectOpen ? 'Zaun Warrens on the Chain' : 'You have Focus',
+      title: triggeredEffectOpen ? 'Respond, or pass Focus' : 'Respond to the showdown, or pass',
+      copy: triggeredEffectOpen
+        ? 'After both players pass, the host resolves discard 1, then draw 1. Take a legal response now or pass.'
+        : 'Play a card or resolve an agreed printed effect. Pass Focus when you have no response.',
+      steps: ['Take one response, if any', 'Resolve its text together', 'Pass Focus'],
+    }
+  } else if (status === 'playing' && activePlayerId === selfId) {
+    nextAction = {
+      tone: 'ready',
+      kicker: 'Your Main Phase',
+      title: 'Choose a card or ready Unit',
+      copy: 'Select a card to play or a ready Unit to move. Legal choices appear beside your hand.',
+      steps: [],
+    }
+  }
 
   return (
-    <main className={`official-game official-game--${status}`}>
+    <main className={`official-game official-game--${status} ${activeSelection ? 'official-game--action-dock-open' : ''}`}>
       <header className="official-game__topbar">
         <button type="button" onClick={onLeave}>Leave table</button>
         <span>Room {room?.code || '—'}</span>
@@ -726,17 +1097,22 @@ export default function OfficialGameBoard({
         )}
       </header>
 
-      <section className="official-game__rules-notice">
-        <strong>Core rules {rulesVersion}</strong>
-        <span>Score 8 to win. The final point must follow the server’s official win-condition checks.</span>
-        <p>Printed card text is not automatically interpreted. Resolve it together, then record only the constrained operation in “Apply printed effect.”</p>
-      </section>
-
-      <section className="official-game__turn-state">
-        <span>Active: <strong>{playerName(players, activePlayerId, 'Not selected')}</strong></span>
-        <span>Phase: <strong>{phase || '—'}</strong></span>
-        <span>Focus: <strong>{playerName(players, focusPlayerId, 'None')}</strong></span>
-        {pending && <span>Host is processing <strong>{pending.replaceAll('_', ' ').toLowerCase()}</strong></span>}
+      <section
+        className={`official-game__action-guide official-game__action-guide--${nextAction.tone}`}
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <div className="official-game__action-guide-copy">
+          <small className="official-game__action-guide-kicker">{nextAction.kicker}</small>
+          <strong>{nextAction.title}</strong>
+          <p>{nextAction.copy}</p>
+        </div>
+        <div className="official-game__match-hud-state">
+          <span>Active <strong>{playerName(players, activePlayerId, 'Not selected')}</strong></span>
+          <span>{showdownOpen ? 'Focus' : 'Showdown'} <strong>{showdownOpen ? playerName(players, focusPlayerId, 'Resolving') : 'Closed'}</strong></span>
+          {pending && <span>Processing <strong>{pending.replaceAll('_', ' ').toLowerCase()}</strong></span>}
+          {cardDecision && <span>Card choice <strong>{ownCardDecision ? 'Choose below' : 'Waiting'}</strong></span>}
+        </div>
       </section>
 
       {status === 'finished' && (
@@ -747,7 +1123,12 @@ export default function OfficialGameBoard({
       )}
 
       {opponent && (
-        <PlayerSummary player={opponent} cardsById={cardsById} selected={selected?.instanceId} />
+        <PlayerSummary
+          player={opponent}
+          cardsById={cardsById}
+          selected={activeSelection?.instanceId}
+          interactionLocked={Boolean(cardDecision)}
+        />
       )}
 
       <section className="official-game__table">
@@ -761,8 +1142,9 @@ export default function OfficialGameBoard({
               players={players}
               selfId={selfId}
               cardsById={cardsById}
-              selected={selected?.instanceId}
+              selected={activeSelection?.instanceId}
               onSelect={chooseOwnCard}
+              interactionLocked={Boolean(cardDecision)}
             />
           ))}
         </div>
@@ -771,8 +1153,8 @@ export default function OfficialGameBoard({
           zone={self?.zones?.base}
           cardsById={cardsById}
           prefix="self-base"
-          selected={selected?.instanceId}
-          selectable
+          selected={activeSelection?.instanceId}
+          selectable={!cardDecision}
           onSelect={(instance) => chooseOwnCard(instance, 'base')}
           compact
         />
@@ -783,18 +1165,19 @@ export default function OfficialGameBoard({
           player={self}
           self
           cardsById={cardsById}
-          selected={selected?.instanceId}
-          canAct={canTakeAction}
-          pending={pending}
+          selected={activeSelection?.instanceId}
           onSelect={chooseOwnCard}
-          onUseRune={(instanceId, mode) => sendAction('USE_RUNE', { instanceId, mode })}
+          interactionLocked={Boolean(cardDecision)}
         />
       )}
 
       {status === 'mulligan' && self && (
         <section className="official-game__mulligan">
-          <header><strong>Opening mulligan</strong><span>Select up to two cards to replace.</span></header>
-          <div className="official-game__mulligan-cards">
+          <header>
+            <strong>Opening mulligan</strong>
+            <span>Selected cards are highlighted. You may replace zero, one, or two.</span>
+          </header>
+          <div className="official-game__mulligan-cards" style={handGridStyle(selfHand.cards.length)}>
             {selfHand.cards.map((value, index) => {
               const instance = normalizedInstance(value, index, 'mulligan')
               return (
@@ -808,121 +1191,341 @@ export default function OfficialGameBoard({
                   selectable={!self.mulliganSubmitted}
                   onSelect={() => toggleMulligan(instance.instanceId)}
                   label={`Mulligan ${cardLookup(cardsById, instance.cardId)?.name || 'card'}`}
+                  hand
                 />
               )
             })}
           </div>
           <button
             type="button"
+            className="official-game__action-button official-game__action-button--primary"
             disabled={!connected || Boolean(pending) || self.mulliganSubmitted}
+            title={!connected
+              ? 'Reconnect before submitting your opening hand.'
+              : pending
+                ? 'Wait for the host to confirm your choice.'
+                : self.mulliganSubmitted
+                  ? 'Your opening choice is already locked.'
+                  : 'This choice cannot be changed after confirmation.'}
             onClick={() => sendAction('SUBMIT_MULLIGAN', { instanceIds: mulliganIds }, () => setMulliganIds([]))}
           >
-            {self.mulliganSubmitted ? 'Mulligan submitted' : `Keep hand · replace ${mulliganIds.length}`}
+            {self.mulliganSubmitted
+              ? 'Opening hand confirmed'
+              : mulliganIds.length
+                ? `Confirm: replace ${mulliganIds.length} selected`
+                : 'Confirm: keep all four cards'}
           </button>
-          <small>{opponent?.mulliganSubmitted ? 'Opponent is ready.' : 'Waiting for the opponent’s choice.'}</small>
+          <small className="official-game__disabled-reason">
+            {self.mulliganSubmitted
+              ? (opponent?.mulliganSubmitted ? 'Both players are ready. The first turn is starting.' : 'Waiting for your opponent’s choice.')
+              : 'Confirm only when you are happy with the highlighted selection.'}
+          </small>
+        </section>
+      )}
+
+      {status === 'playing' && activeSelection && !cardDecision && (
+        <section
+          ref={actionDockRef}
+          className={`official-game__selection-panel official-game__action-dock official-game__action-dock--${actionDockMode} ${actionDockBlocked ? 'official-game__action-dock--blocked' : ''}`}
+          role="region"
+          aria-labelledby="battle-action-dock-title"
+          tabIndex={-1}
+        >
+          <header className="official-game__action-dock-header">
+            <span className="official-game__action-dock-title">
+              <small>{titleCase(activeSelection.zone)} selected · actions ready here</small>
+              <strong id="battle-action-dock-title">{selectedCard?.name || activeSelection.cardId}</strong>
+            </span>
+            <button
+              type="button"
+              className="official-game__action-dock-close"
+              onClick={dismissSelection}
+              aria-label="Close card actions and return to the selected card"
+              title="Close card actions (Escape)"
+            >×</button>
+          </header>
+
+          <div className="official-game__action-dock-body">
+            <div className="official-game__action-dock-controls">
+              <div
+                className={`official-game__action-dock-status official-game__action-dock-status--${actionDockStatusTone}`}
+                aria-live="polite"
+              >
+                <strong>{actionDockStatusTitle}</strong>
+                <span>{actionDockStatusCopy}</span>
+              </div>
+
+              <div className="official-game__action-dock-actions">
+                {selectionFromHand && selectedType === 'spell' && (
+                  <div className="official-game__action-dock-primary">
+                    <button
+                      ref={primaryActionRef}
+                      type="button"
+                      className="official-game__action-button official-game__action-button--primary"
+                      disabled={!canPlaySelected}
+                      title={playDisabledReason || 'Cast this Spell; it moves to trash after resolving'}
+                      onClick={() => playSelected('base')}
+                    >Cast {selectedCard?.name || 'Spell'}</button>
+                  </div>
+                )}
+
+                {selectionFromHand && selectedType === 'gear' && (
+                  <div className="official-game__action-dock-primary">
+                    <button
+                      ref={primaryActionRef}
+                      type="button"
+                      className="official-game__action-button official-game__action-button--primary"
+                      disabled={!canPlaySelected}
+                      title={playDisabledReason || 'Play this Gear to your base'}
+                      onClick={() => playSelected('base')}
+                    >Play Gear to your base</button>
+                  </div>
+                )}
+
+                {selectionFromHand && selectedType === 'unit' && (
+                  <>
+                    <div className="official-game__action-dock-primary">
+                      <button
+                        ref={primaryActionRef}
+                        type="button"
+                        className="official-game__action-button official-game__action-button--primary"
+                        disabled={!canPlaySelected}
+                        title={playDisabledReason || 'Play this Unit exhausted to your base'}
+                        onClick={() => playSelected('base')}
+                      >Play Unit to your base</button>
+                    </div>
+                    {controlledBattlefields.length > 0 && (
+                      <div className="official-game__action-dock-secondary">
+                        <span className="official-game__action-dock-secondary-label">Or play to a controlled battlefield</span>
+                        {controlledBattlefields.map((field) => {
+                          const battlefieldIndex = battlefields.findIndex((candidate) => candidate?.instanceId === field.instanceId)
+                          const fieldName = cardLookup(cardsById, field.cardId)?.name || `Battlefield ${battlefieldIndex + 1}`
+                          return (
+                            <button
+                              type="button"
+                              className="official-game__action-button official-game__action-button--secondary"
+                              disabled={!canPlaySelected}
+                              title={playDisabledReason || `Play this Unit exhausted to ${fieldName}`}
+                              key={field.instanceId}
+                              onClick={() => playSelected(field.instanceId)}
+                            >Play to {fieldName}</button>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {!selectionFromHand && selectedIsBoardUnit && standardMoveDestinations.length > 0 && (
+                  <>
+                    {standardMoveDestinations.length === 1 ? (
+                      <div className="official-game__action-dock-primary">
+                        <button
+                          ref={primaryActionRef}
+                          type="button"
+                          className="official-game__action-button official-game__action-button--primary"
+                          disabled={!canMoveSelected}
+                          title={moveDisabledReason || `Standard Move to ${standardMoveDestinations[0].label}`}
+                          onClick={() => moveSelected(standardMoveDestinations[0].value)}
+                        >Standard Move → {standardMoveDestinations[0].label}</button>
+                      </div>
+                    ) : (
+                      <div className="official-game__action-dock-secondary">
+                        <span className="official-game__action-dock-secondary-label">Choose a battlefield · no destination is preselected</span>
+                        {standardMoveDestinations.map((destination) => (
+                          <button
+                            type="button"
+                            className="official-game__action-button official-game__action-button--secondary official-game__action-dock-destination"
+                            disabled={!canMoveSelected}
+                            title={moveDisabledReason || `Standard Move to ${destination.label}. ${destination.context}`}
+                            key={destination.value}
+                            onClick={() => moveSelected(destination.value)}
+                          >
+                            <strong>Standard Move → {destination.label}</strong>
+                            <small>{destination.context}</small>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {status === 'playing' && cardDecision && (
+        <section
+          className={`official-game__card-decision ${ownCardDecision ? 'official-game__card-decision--mine' : ''}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div>
+            <small>{ownCardDecision ? `${decisionSourceName} · Conquer effect` : 'Private effect choice'}</small>
+            <strong>{ownCardDecision ? 'Discard 1, then draw 1' : `${playerName(players, cardDecision.playerId)} is choosing`}</strong>
+            <span>{ownCardDecision
+              ? 'Select any highlighted card in your hand. One click resolves the discard; the draw follows automatically.'
+              : 'No action is needed from you. Hidden card information stays on the deciding player’s device.'}</span>
+          </div>
+          {ownCardDecision && <b>{decisionEligibleIds.length} legal cards</b>}
         </section>
       )}
 
       {status === 'playing' && self && (
         <section className="official-game__hand">
           <header><strong>Your hand</strong><span>{selfHand.count} cards · private to this device</span></header>
-          <div className="official-game__hand-cards">
-            {selfHand.cards.length > 0 ? selfHand.cards.map((value, index) => (
-              <InstanceCard
-                key={normalizedInstance(value, index, 'hand')._key}
-                value={value}
-                index={index}
-                prefix="hand"
-                cardsById={cardsById}
-                selected={selected?.instanceId}
-                selectable
-                onSelect={(instance) => chooseOwnCard(instance, 'hand')}
-              />
-            )) : <span className="official-game__empty">Your hand is empty</span>}
+          <div className="official-game__hand-cards" style={handGridStyle(selfHand.cards.length)}>
+            {selfHand.cards.length > 0 ? selfHand.cards.map((value, index) => {
+              const instance = normalizedInstance(value, index, 'hand')
+              const prompted = Boolean(ownCardDecision && decisionEligibleIds.includes(instance.instanceId))
+              return (
+                <InstanceCard
+                  key={instance._key}
+                  value={instance}
+                  index={index}
+                  prefix="hand"
+                  cardsById={cardsById}
+                  selected={activeSelection?.instanceId}
+                  selectable={!pending && (!cardDecision || prompted)}
+                  onSelect={(chosen) => chooseOwnCard(chosen, 'hand')}
+                  prompted={prompted}
+                  hand
+                />
+              )
+            }) : <span className="official-game__empty">Your hand is empty</span>}
           </div>
         </section>
       )}
 
-      {status === 'playing' && selected && (
-        <section className="official-game__selection-panel">
-          <header><strong>Selected: {cardLookup(cardsById, selected.cardId)?.name || selected.cardId}</strong><button type="button" onClick={() => setSelected(null)}>Clear</button></header>
-          {['hand', 'champion'].includes(selected.zone) && (
-            <div className="official-game__selection-actions">
-              <small>
-                Normal declared cost: {selectedSpend.energy} Energy
-                {selectedPowerEntry ? ` + ${selectedPowerEntry[1]} ${selectedPowerEntry[0]} Power` : ''}.
-              </small>
-              <button type="button" disabled={!canTakeAction} onClick={() => playSelected('base')}>Play to base</button>
-              {controlledBattlefields.map((field, index) => (
-                <button type="button" disabled={!canTakeAction} key={field.instanceId} onClick={() => playSelected(field.instanceId)}>Play to battlefield {index + 1}</button>
-              ))}
-              {controlledBattlefields.length === 0 && <small>Control a battlefield before playing directly to one.</small>}
-            </div>
-          )}
-          {['base', 'battlefield'].includes(selected.zone) && (
-            <div className="official-game__selection-actions">
-              {selected.zone === 'battlefield' && (
-                <button type="button" disabled={!canTakeAction} onClick={() => moveSelected('base')}>Move to base</button>
-              )}
-              {selected.zone === 'base' && battlefields.filter(Boolean).map((field, index) => (
-                <button
-                  type="button"
-                  disabled={!canTakeAction}
-                  key={field.instanceId}
-                  onClick={() => moveSelected(field.instanceId)}
-                >Move to battlefield {index + 1}</button>
-              ))}
-              {selected.zone === 'battlefield' && <small>Battlefield-to-battlefield movement is available only through a verified Ganking effect.</small>}
-            </div>
-          )}
-        </section>
-      )}
-
-      {status === 'playing' && (
+      {status === 'playing' && !cardDecision && !awaitingCombatAssignment && (showdownOpen || (activePlayerId === selfId && !game?.combat)) && (
         <section className="official-game__priority-actions">
-          <button type="button" disabled={!connected || focusPlayerId !== selfId || Boolean(pending)} onClick={() => sendAction('PASS_FOCUS')}>Pass focus</button>
-          <button type="button" disabled={!canTakeTurnAction || phase !== 'main'} onClick={() => sendAction('END_MAIN')}>End main phase</button>
-          <button type="button" disabled={!canTakeTurnAction || phase !== 'main'} onClick={() => sendAction('END_TURN')}>End turn</button>
+          <div className="official-game__priority-copy">
+            <strong>{triggeredEffectOpen ? 'Zaun Warrens trigger' : showdownOpen ? 'Showdown response' : 'Finished taking actions?'}</strong>
+            <span>{showdownOpen
+              ? (canPassFocus
+                  ? (triggeredEffectOpen
+                      ? 'Pass if you have no response. The discard/draw starts after both players pass.'
+                      : 'Pass only when you do not want to take another response.')
+                  : `Waiting for ${playerName(players, focusPlayerId)} to respond.`)
+              : 'Ending the turn clears unspent Rune Pool resources and begins your opponent’s turn.'}</span>
+          </div>
+          <div className="official-game__priority-buttons">
+            {canPassFocus && (
+              <button
+                type="button"
+                className="official-game__action-button official-game__action-button--primary"
+                onClick={() => sendAction('PASS_FOCUS')}
+              >Pass Focus · no response</button>
+            )}
+            {!showdownOpen && (
+              <button
+                type="button"
+                className="official-game__action-button official-game__action-button--secondary"
+                disabled={!canEndTurn}
+                title={canEndTurn ? 'Finish your Main Phase and begin the opponent’s turn' : actionDisabledReason || 'Resolve the current action first'}
+                onClick={() => sendAction('END_TURN')}
+              >End turn</button>
+            )}
+          </div>
         </section>
       )}
 
       {combat && (
-        <section className="official-game__combat">
+        <section className={`official-game__combat ${expectedDamagePlayerId ? 'official-game__combat--assigning' : 'official-game__combat--showdown'}`}>
           <header>
-            <strong>Combat · {combat.stage || 'resolving'}</strong>
+            <strong>Combat · {titleCase(String(combat.stage || 'resolving').replaceAll('-', ' '))}</strong>
             <span>{playerName(players, combatAttackerId, 'Attacker')} attacks {playerName(players, combatDefenderId, 'Defender')}</span>
           </header>
           <div className="official-game__combat-might">
             {Object.entries(mightTotals).map(([key, value]) => <span key={key}>{playerName(players, key, key)}: <b>{value}</b> Might</span>)}
           </div>
-          <label className="official-game__field-label">
-            First damage target
-            <select value={legalDamageTarget} onChange={(event) => setDamageTarget(event.target.value)}>
-              {opposingCombatUnits.map((instance) => <option value={instance.instanceId} key={instance.instanceId}>{cardLookup(cardsById, instance.cardId)?.name || instance.cardId}</option>)}
-            </select>
-          </label>
-          {combatAllocations.length > 0 && (
-            <ul className="official-game__combat-allocation">
-              {combatAllocations.map((allocation) => {
-                const instance = opposingCombatUnits.find((unit) => unit.instanceId === allocation.instanceId)
-                return <li key={allocation.instanceId}>{cardLookup(cardsById, instance?.cardId)?.name || instance?.cardId}: {allocation.amount} damage</li>
-              })}
-            </ul>
+          {!expectedDamagePlayerId && (
+            <p className="official-game__combat-instruction">
+              The showdown response window is open. The player with Focus may respond; damage assignment begins after both players pass consecutively.
+            </p>
           )}
-          <button
-            type="button"
-            disabled={!canAssignCombat || (ownCombatMight > 0 && combatAllocations.length < 1)}
-            onClick={() => sendAction('ASSIGN_COMBAT_DAMAGE', { allocations: combatAllocations })}
-          >{ownCombatMight > 0 ? 'Assign combat damage' : 'Confirm zero combat damage'}</button>
-          {expectedDamagePlayerId && expectedDamagePlayerId !== selfId && <small>Waiting for {playerName(players, expectedDamagePlayerId)} to assign damage.</small>}
-          {opposingCombatUnits.length === 0 && <small>No opposing unit is available for a default allocation.</small>}
+          {expectedDamagePlayerId && expectedDamagePlayerId !== selfId && (
+            <p className="official-game__combat-instruction">Waiting for {playerName(players, expectedDamagePlayerId)} to assign their combat damage.</p>
+          )}
+          {expectedDamagePlayerId === selfId && (
+            <div className="official-game__combat-assignment">
+              <div className="official-game__selection-step">
+                <small>{ownCombatMight > 0 ? '1 · Set damage order' : 'Combat total'}</small>
+                <strong>{ownCombatMight > 0 ? `${ownCombatMight} Might to assign` : 'No damage to assign'}</strong>
+                <span>{ownCombatMight > 0
+                  ? 'Arrange every opposing Unit in the order it should receive damage. Each Unit before the last must receive exactly lethal damage.'
+                  : 'Your side has 0 Might. Confirm zero damage so combat can continue.'}</span>
+              </div>
+              {ownCombatMight > 0 && opposingCombatUnits.length > 0 && (
+                <div className="official-game__combat-order" aria-live="polite" aria-atomic="true">
+                  <strong>Damage order</strong>
+                  <ol aria-label="Combat damage target order">
+                    {orderedCombatTargets.map((instance, index) => {
+                      const targetName = cardLookup(cardsById, instance.cardId)?.name || instance.cardId
+                      const lethal = Math.max(1, currentUnitMight(cardsById, instance) - (Number(instance.damage) || 0))
+                      return (
+                        <li className="official-game__combat-order-item" key={instance.instanceId}>
+                          <b>{index + 1}</b>
+                          <span className="official-game__combat-order-copy">
+                            <strong>{targetName}</strong>
+                            <small>{lethal} damage is lethal now</small>
+                          </span>
+                          <span className="official-game__combat-order-actions">
+                            <button
+                              type="button"
+                              disabled={!canAssignCombat || index === 0}
+                              aria-label={`Move ${targetName} earlier in damage order`}
+                              onClick={() => moveCombatTarget(instance.instanceId, -1)}
+                            >Earlier</button>
+                            <button
+                              type="button"
+                              disabled={!canAssignCombat || index === orderedCombatTargets.length - 1}
+                              aria-label={`Move ${targetName} later in damage order`}
+                              onClick={() => moveCombatTarget(instance.instanceId, 1)}
+                            >Later</button>
+                          </span>
+                        </li>
+                      )
+                    })}
+                  </ol>
+                </div>
+              )}
+              {ownCombatMight > 0 && <div className="official-game__selection-step">
+                <small>2 · Review allocation</small>
+                {combatAllocations.length > 0 ? (
+                  <ul className="official-game__combat-allocation">
+                    {combatAllocations.map((allocation) => {
+                      const instance = opposingCombatUnits.find((unit) => unit.instanceId === allocation.instanceId)
+                      return <li key={allocation.instanceId}><strong>{allocation.amount} damage</strong><span>{cardLookup(cardsById, instance?.cardId)?.name || instance?.cardId}</span></li>
+                    })}
+                  </ul>
+                ) : <span className="official-game__disabled-reason">No legal damage allocation is available.</span>}
+              </div>}
+              <button
+                type="button"
+                className="official-game__action-button official-game__action-button--primary"
+                disabled={!canAssignCombat || (ownCombatMight > 0 && combatAllocations.length < 1)}
+                title={!canAssignCombat ? 'Wait until the host asks you to assign damage.' : 'Lock this damage assignment; it cannot be edited afterward.'}
+                onClick={() => sendAction('ASSIGN_COMBAT_DAMAGE', { allocations: combatAllocations })}
+              >{ownCombatMight > 0 ? `Confirm ${ownCombatMight} combat damage` : 'Confirm zero combat damage'}</button>
+              {opposingCombatUnits.length === 0 && ownCombatMight > 0 && <span className="official-game__disabled-reason">No opposing Unit is available for a legal allocation.</span>}
+            </div>
+          )}
         </section>
       )}
 
-      {status === 'playing' && (
+      {status === 'playing' && !cardDecision && (
         <details className="official-game__effect-panel">
-          <summary>Apply printed effect</summary>
-          <p>Use this only after both players read and agree on the physical card text.</p>
+          <summary><span>Optional manual tool</span> Resolve printed card effect</summary>
+          <p className="official-game__effect-intro">
+            Vetted triggers such as Zaun Warrens resolve automatically. For other printed text, read the card, agree on its result together, then record one legal board-state change here—including an instructed discard or recycle.
+          </p>
+          <ol className="official-game__effect-steps">
+            <li>Describe the card and effect</li>
+            <li>Choose exactly one operation and target</li>
+            <li>Review, then apply</li>
+          </ol>
           <label className="official-game__field-label">
             Effect description
             <input
@@ -1021,15 +1624,12 @@ export default function OfficialGameBoard({
           )}
           <button
             type="button"
-            disabled={
-              !canTakeAction
-              || !effect.description.trim()
-              || !legalEffectTarget
-              || (['move', 'create_token'].includes(effect.operation) && !legalEffectDestination)
-              || (effect.operation === 'create_token' && !legalTokenCardId)
-            }
+            className="official-game__action-button official-game__action-button--primary"
+            disabled={Boolean(effectSubmitReason)}
+            title={effectSubmitReason || 'Apply this agreed operation and record it in the game log'}
             onClick={applyManualEffect}
-          >Apply agreed effect</button>
+          >Apply and record agreed effect</button>
+          {effectSubmitReason && <span className="official-game__disabled-reason">{effectSubmitReason}</span>}
         </details>
       )}
 

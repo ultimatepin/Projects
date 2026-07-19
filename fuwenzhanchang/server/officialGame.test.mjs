@@ -11,12 +11,14 @@ import {
   serialiseOfficialGame,
   validateDeckDefinition,
 } from "./officialGame.js";
+import { deriveCardResourceCost, planRunePayment } from "./runePayment.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cards = JSON.parse(
   fs.readFileSync(path.resolve(here, "../public/cards.json"), "utf8"),
 );
 const catalog = new Map(cards.map((card) => [card.id, card]));
+const ZAUN_WARRENS_CARD_ID = "ogn-298-298";
 
 function regularCards(type) {
   return cards.filter(
@@ -79,6 +81,9 @@ function playReadyUnitToBase(game, playerId) {
     (instance) => catalog.get(instance.cardId)?.type === "Unit",
   );
   assert.ok(unit, "player should have a Unit in hand");
+  const cost = deriveCardResourceCost(catalog.get(unit.cardId));
+  player.runePool.energy = cost.energy;
+  player.runePool.powerByDomain = { ...cost.powerByDomain };
   act(game, playerId, "PLAY_CARD", {
     instanceId: unit.instanceId,
     destination: "base",
@@ -96,6 +101,26 @@ function closeShowdown(game) {
   act(game, first, "PASS_FOCUS");
   const second = game.showdown.focusPlayerId;
   act(game, second, "PASS_FOCUS");
+}
+
+function prepareZaunConquer(game, player, battlefield = game.battlefields[0]) {
+  battlefield.cardId = ZAUN_WARRENS_CARD_ID;
+  const unit = playReadyUnitToBase(game, player.id);
+  return { battlefield, unit };
+}
+
+function conquerWithUnit(game, player, battlefield, unit, { resolveTrigger = true } = {}) {
+  act(game, player.id, "STANDARD_MOVE", {
+    unitIds: [unit.instanceId],
+    destination: battlefield.instanceId,
+  });
+  closeShowdown(game);
+  if (resolveTrigger && game.showdown?.type === "triggered-effect") closeShowdown(game);
+}
+
+function keepOnlyHandCards(player, count) {
+  const removed = player.zones.hand.splice(count);
+  player.zones.trash.push(...removed);
 }
 
 test("deck validation enforces structure, copy-by-name bans, and exact-precon exception", () => {
@@ -164,6 +189,89 @@ test("setup preserves the Chosen Champion, opening hand, mulligan, and automatic
   assert.deepEqual(Object.keys(own.zones.runeDeck), ["count"]);
 });
 
+test("PLAY_CARD derives one atomic Rune payment and rejects free or spoofed plays", () => {
+  const game = finishMulligans(newGame());
+  let player = activePlayer(game);
+  const sourceIndex = player.zones.mainDeck.findIndex((instance) => {
+    const card = catalog.get(instance.cardId);
+    return card?.type === "Unit" && Number(card?.stats?.power || 0) > 0;
+  });
+  assert.ok(sourceIndex >= 0, "test deck needs a Unit with a Power cost");
+  const [instance] = player.zones.mainDeck.splice(sourceIndex, 1);
+  player.zones.hand.push(instance);
+  const card = catalog.get(instance.cardId);
+
+  player.zones.runeDeck.unshift(...player.zones.runes.splice(0));
+  const unaffordableSnapshot = structuredClone(game);
+  assert.throws(
+    () => act(game, player.id, "PLAY_CARD", {
+      instanceId: instance.instanceId,
+      destination: "base",
+    }),
+    (error) => error instanceof OfficialGameError
+      && error.code === "INSUFFICIENT_CARD_RESOURCES",
+  );
+  assert.deepEqual(game, unaffordableSnapshot, "an unpaid play must roll back completely");
+  player = activePlayer(game);
+  player.runePool.energy = 2;
+
+  let plan = planRunePayment({
+    card,
+    runePool: player.runePool,
+    runes: player.zones.runes,
+    cardsById: catalog,
+  });
+  while (!plan.affordable && player.zones.runeDeck.length) {
+    const rune = player.zones.runeDeck.pop();
+    rune.exhausted = false;
+    player.zones.runes.push(rune);
+    plan = planRunePayment({
+      card,
+      runePool: player.runePool,
+      runes: player.zones.runes,
+      cardsById: catalog,
+    });
+  }
+  assert.equal(plan.affordable, true);
+  assert.ok(plan.exhaustIds.length > 0, "payment should exhaust ready Runes for Energy");
+  assert.ok(plan.recycleIds.length > 0, "payment should recycle a matching Rune for Power");
+
+  const spoofedSnapshot = structuredClone(game);
+  assert.throws(
+    () => act(game, player.id, "PLAY_CARD", {
+      instanceId: instance.instanceId,
+      destination: "base",
+      spend: { energy: 0, powerByDomain: {} },
+    }),
+    (error) => error instanceof OfficialGameError
+      && error.code === "DECLARED_COST_MISMATCH",
+  );
+  assert.deepEqual(game, spoofedSnapshot, "a spoofed legacy cost must not change Rune state");
+  player = activePlayer(game);
+
+  act(game, player.id, "PLAY_CARD", {
+    instanceId: instance.instanceId,
+    destination: "base",
+  });
+  assert.ok(player.zones.base.some((candidate) => candidate.instanceId === instance.instanceId));
+  assert.equal(player.runePool.energy, 0);
+  assert.equal(player.runePool.powerByDomain[card.faction], 0);
+  for (const instanceId of plan.recycleIds) {
+    assert.ok(player.zones.runeDeck.some((rune) => rune.instanceId === instanceId));
+    assert.ok(!player.zones.runes.some((rune) => rune.instanceId === instanceId));
+  }
+  for (const instanceId of plan.exhaustIds.filter((id) => !plan.recycleIds.includes(id))) {
+    assert.equal(
+      player.zones.runes.find((rune) => rune.instanceId === instanceId)?.exhausted,
+      true,
+    );
+  }
+  assert.equal(game.history.at(-2)?.type, "PAY_COST");
+  assert.equal(game.history.at(-2)?.data.fromPool.energy, 2);
+  assert.match(game.history.at(-2)?.message || "", /used 2 Energy already in the Rune Pool/);
+  assert.equal(game.history.at(-1)?.type, "PLAY_UNIT");
+});
+
 test("runes, final-point Conquer restriction, scoring, and cleanup produce an official win", () => {
   const game = finishMulligans(newGame());
   const player = activePlayer(game);
@@ -204,6 +312,273 @@ test("runes, final-point Conquer restriction, scoring, and cleanup produce an of
   assert.equal(game.winnerPlayerId, player.id);
   assert.equal(game.result.reason, "victory-score-cleanup");
   assert.equal(rival.score, 0);
+});
+
+test("Zaun Warrens creates a private server-authoritative discard choice and resolves atomically", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const rival = opponent(game, player.id);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  const handBefore = player.zones.hand.length;
+  const deckBefore = player.zones.mainDeck.length;
+
+  conquerWithUnit(game, player, battlefield, unit);
+
+  assert.equal(battlefield.controllerPlayerId, player.id);
+  assert.equal(player.score, 1);
+  assert.equal(player.zones.hand.length, handBefore, "the server must wait for the discard choice");
+  assert.equal(player.zones.mainDeck.length, deckBefore, "the follow-up draw must not happen early");
+  assert.ok(game.pendingDecision);
+  assert.equal(game.pendingDecision.kind, "card-selection");
+  assert.equal(game.pendingDecision.playerId, player.id);
+  assert.equal(game.pendingDecision.source.cardId, ZAUN_WARRENS_CARD_ID);
+  assert.equal(game.pendingDecision.selection.operation, "discard");
+  assert.deepEqual(
+    new Set(game.pendingDecision.selection.eligibleInstanceIds),
+    new Set(player.zones.hand.map((card) => card.instanceId)),
+  );
+
+  const ownView = serialiseOfficialGame(game, player.id);
+  const rivalView = serialiseOfficialGame(game, rival.id);
+  assert.equal(ownView.pendingDecision.id, game.pendingDecision.id);
+  assert.deepEqual(rivalView.pendingDecision, {
+    playerId: player.id,
+    kind: "card-selection",
+  });
+
+  const decisionId = game.pendingDecision.id;
+  const discarded = player.zones.hand[0];
+  act(game, player.id, "RESOLVE_PENDING_DECISION", {
+    decisionId,
+    instanceIds: [discarded.instanceId],
+  });
+
+  assert.equal(game.pendingDecision, null);
+  assert.equal(player.zones.hand.length, handBefore, "discard 1 then draw 1 preserves hand size");
+  assert.equal(player.zones.mainDeck.length, deckBefore - 1);
+  assert.ok(player.zones.trash.some((card) => card.instanceId === discarded.instanceId));
+  assert.ok(game.history.some((entry) => entry.type === "DISCARD"));
+  assert.ok(
+    game.history.some(
+      (entry) => entry.type === "CARD_EFFECT" && entry.data.sourceCardId === ZAUN_WARRENS_CARD_ID,
+    ),
+  );
+});
+
+test("Zaun Warrens enters a Focus response window before resolving its Conquer trigger", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const rival = opponent(game, player.id);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  const handBefore = player.zones.hand.length;
+
+  conquerWithUnit(game, player, battlefield, unit, { resolveTrigger: false });
+
+  assert.equal(game.showdown?.type, "triggered-effect");
+  assert.equal(game.showdown?.pendingEffect?.kind, "zaun-warrens-conquer");
+  assert.equal(game.showdown?.focusPlayerId, player.id);
+  assert.equal(game.pendingDecision, null);
+  assert.equal(player.zones.hand.length, handBefore);
+
+  act(game, player.id, "PASS_FOCUS");
+  assert.equal(game.showdown?.focusPlayerId, rival.id);
+  assert.equal(game.pendingDecision, null);
+  act(game, rival.id, "PASS_FOCUS");
+
+  assert.equal(game.showdown, null);
+  assert.ok(game.pendingDecision, "the discard choice begins only after both players pass");
+  assert.equal(game.pendingDecision.playerId, player.id);
+});
+
+test("a nested battlefield response resolves before the Zaun trigger window resumes", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const rival = opponent(game, player.id);
+  const responseUnit = playReadyUnitToBase(game, player.id);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+
+  conquerWithUnit(game, player, battlefield, unit, { resolveTrigger: false });
+  assert.equal(game.showdown?.type, "triggered-effect");
+  act(game, player.id, "PASS_FOCUS");
+  assert.equal(game.showdown?.focusPlayerId, rival.id);
+  assert.equal(game.showdown?.consecutivePasses, 1);
+
+  act(game, rival.id, "APPLY_EFFECT", {
+    description: "a printed move response that contests the other battlefield",
+    operations: [{
+      type: "move",
+      instanceId: responseUnit.instanceId,
+      destination: game.battlefields[1].instanceId,
+    }],
+  });
+
+  assert.equal(game.showdown?.type, "non-combat");
+  assert.equal(game.suspendedWindows.length, 1);
+  assert.equal(game.suspendedWindows[0].showdown.type, "triggered-effect");
+  assert.equal(game.suspendedWindows[0].showdown.focusPlayerId, player.id);
+  assert.equal(game.suspendedWindows[0].showdown.consecutivePasses, 0);
+
+  closeShowdown(game);
+  assert.equal(game.suspendedWindows.length, 0);
+  assert.equal(game.showdown?.type, "triggered-effect");
+  assert.equal(game.showdown?.pendingEffect?.kind, "zaun-warrens-conquer");
+  assert.equal(
+    game.showdown?.focusPlayerId,
+    player.id,
+    "the response action passes Focus before the original window resumes",
+  );
+  assert.equal(game.showdown?.consecutivePasses, 0);
+
+  closeShowdown(game);
+  assert.equal(game.showdown, null);
+  assert.ok(game.pendingDecision);
+  assert.equal(game.pendingDecision.playerId, player.id);
+});
+
+test("pending Zaun choices reject wrong, stale, invalid, and unrelated actions without mutation", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const rival = opponent(game, player.id);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  conquerWithUnit(game, player, battlefield, unit);
+  const decisionId = game.pendingDecision.id;
+  const validId = game.pendingDecision.selection.eligibleInstanceIds[0];
+
+  function expectRollback(run, code) {
+    const before = JSON.stringify(game);
+    assert.throws(
+      run,
+      (error) => error instanceof OfficialGameError && error.code === code,
+    );
+    assert.equal(JSON.stringify(game), before);
+  }
+
+  expectRollback(
+    () => act(game, rival.id, "RESOLVE_PENDING_DECISION", {
+      decisionId,
+      instanceIds: [validId],
+    }),
+    "NOT_YOUR_PENDING_DECISION",
+  );
+  expectRollback(
+    () => act(game, player.id, "RESOLVE_PENDING_DECISION", {
+      decisionId: "stale-decision",
+      instanceIds: [validId],
+    }),
+    "STALE_PENDING_DECISION",
+  );
+  expectRollback(
+    () => act(game, player.id, "RESOLVE_PENDING_DECISION", {
+      decisionId,
+      instanceIds: [game.players.find((candidate) => candidate.id === player.id).zones.runes[0].instanceId],
+    }),
+    "INVALID_PENDING_SELECTION",
+  );
+  expectRollback(
+    () => act(game, player.id, "END_TURN"),
+    "PENDING_DECISION_REQUIRED",
+  );
+
+  act(game, player.id, "RESOLVE_PENDING_DECISION", {
+    decisionId,
+    instanceIds: [validId],
+  });
+  assert.throws(
+    () => act(game, player.id, "RESOLVE_PENDING_DECISION", {
+      decisionId,
+      instanceIds: [validId],
+    }),
+    (error) => error instanceof OfficialGameError && error.code === "NO_PENDING_DECISION",
+  );
+});
+
+test("either player may concede while a Zaun Warrens choice is pending", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const rival = opponent(game, player.id);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  conquerWithUnit(game, player, battlefield, unit);
+  assert.ok(game.pendingDecision);
+
+  act(game, rival.id, "CONCEDE");
+
+  assert.equal(game.pendingDecision, null);
+  assert.equal(game.status, "finished");
+  assert.equal(game.winnerPlayerId, player.id);
+  assert.equal(game.result.reason, "concession");
+});
+
+test("Zaun Warrens auto-resolves when discard has zero or one possible card", () => {
+  for (const retainedCards of [0, 1]) {
+    const game = finishMulligans(newGame());
+    const player = activePlayer(game);
+    const { battlefield, unit } = prepareZaunConquer(game, player);
+    keepOnlyHandCards(player, retainedCards);
+    const discardedId = player.zones.hand[0]?.instanceId || null;
+    const deckBefore = player.zones.mainDeck.length;
+    const trashBefore = player.zones.trash.length;
+
+    conquerWithUnit(game, player, battlefield, unit);
+
+    assert.equal(game.pendingDecision, null);
+    assert.equal(player.zones.hand.length, 1);
+    assert.equal(player.zones.mainDeck.length, deckBefore - 1);
+    assert.equal(
+      player.zones.trash.length,
+      trashBefore + (discardedId ? 1 : 0),
+    );
+    if (discardedId) {
+      assert.ok(player.zones.trash.some((card) => card.instanceId === discardedId));
+    }
+  }
+});
+
+test("Zaun Warrens still triggers after final-point replacement draw", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  player.score = 7;
+  const handBefore = player.zones.hand.length;
+  const deckBefore = player.zones.mainDeck.length;
+
+  conquerWithUnit(game, player, battlefield, unit);
+
+  assert.equal(player.score, 7);
+  assert.equal(player.zones.hand.length, handBefore + 1, "the final-point replacement draws first");
+  assert.equal(player.zones.mainDeck.length, deckBefore - 1);
+  assert.ok(game.pendingDecision, "the Conquer effect triggers even when its point was replaced");
+
+  act(game, player.id, "RESOLVE_PENDING_DECISION", {
+    decisionId: game.pendingDecision.id,
+    instanceIds: [player.zones.hand[0].instanceId],
+  });
+  assert.equal(player.zones.hand.length, handBefore + 1);
+  assert.equal(player.zones.mainDeck.length, deckBefore - 2);
+  assert.equal(game.status, "playing");
+});
+
+test("victory cleanup waits for a pending Zaun Warrens effect", () => {
+  const game = finishMulligans(newGame());
+  const player = activePlayer(game);
+  const { battlefield, unit } = prepareZaunConquer(game, player);
+  player.score = 7;
+  for (const other of game.battlefields) {
+    if (other !== battlefield) other.scoredTurnByPlayer[player.id] = game.turn.number;
+  }
+
+  conquerWithUnit(game, player, battlefield, unit);
+
+  assert.equal(player.score, 8);
+  assert.equal(game.status, "playing");
+  assert.ok(game.pendingDecision);
+  act(game, player.id, "RESOLVE_PENDING_DECISION", {
+    decisionId: game.pendingDecision.id,
+    instanceIds: [player.zones.hand[0].instanceId],
+  });
+  assert.equal(game.pendingDecision, null);
+  assert.equal(game.status, "finished");
+  assert.equal(game.winnerPlayerId, player.id);
+  assert.equal(game.result.reason, "victory-score-cleanup");
 });
 
 test("combat assigns current Might, deals simultaneously, kills, heals, recalls, and updates control", () => {

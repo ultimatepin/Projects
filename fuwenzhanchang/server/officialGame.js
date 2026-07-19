@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 
+import { planRunePayment, RUNE_DOMAINS } from "./runePayment.js";
+
 export const OFFICIAL_CORE_RULES_VERSION = "2026-03-30";
 export const OFFICIAL_GAME_PROFILE = "standard-constructed-duel";
 export const VICTORY_SCORE = 8;
@@ -9,6 +11,7 @@ const RUNE_DECK_SIZE = 12;
 const BATTLEFIELD_POOL_SIZE = 3;
 const MAX_MANUAL_OPERATIONS = 24;
 const MAX_HISTORY = 200;
+const ZAUN_WARRENS_CARD_ID = "ogn-298-298";
 const PLAYER_ZONE_NAMES = [
   "legend",
   "champion",
@@ -242,7 +245,7 @@ export function createOfficialGame(players, cardsById) {
       coreVersion: OFFICIAL_CORE_RULES_VERSION,
       profile: OFFICIAL_GAME_PROFILE,
       victoryScore: VICTORY_SCORE,
-      automation: "official-process-manual-card-effects",
+      automation: "official-process-auto-costs-vetted-effects",
     },
     status: "mulligan",
     winnerPlayerId: null,
@@ -258,6 +261,7 @@ export function createOfficialGame(players, cardsById) {
       focusPlayerId: null,
     },
     pendingDecision: null,
+    suspendedWindows: [],
     showdown: null,
     combat: null,
     players: normalizedPlayers,
@@ -299,6 +303,20 @@ export function applyOfficialAction(game, playerId, rawAction, cardsById) {
     if (game.status === "finished" && type !== "REQUEST_UNDO") {
       fail("GAME_FINISHED", "This game has already finished.");
     }
+    if (
+      game.pendingDecision &&
+      type !== "RESOLVE_PENDING_DECISION" &&
+      type !== "CONCEDE"
+    ) {
+      fail(
+        "PENDING_DECISION_REQUIRED",
+        "Resolve the pending card choice before taking another action.",
+        {
+          kind: game.pendingDecision.kind,
+          playerId: game.pendingDecision.playerId,
+        },
+      );
+    }
 
     switch (type) {
       case "MULLIGAN":
@@ -319,6 +337,9 @@ export function applyOfficialAction(game, playerId, rawAction, cardsById) {
         break;
       case "ASSIGN_COMBAT_DAMAGE":
         assignCombatDamage(game, player, payload, catalog);
+        break;
+      case "RESOLVE_PENDING_DECISION":
+        resolvePendingDecision(game, player, payload, catalog);
         break;
       case "APPLY_EFFECT":
       case "APPLY_MANUAL_EFFECT":
@@ -364,6 +385,9 @@ export function serialiseOfficialGame(game, viewerId) {
         : game.pendingDecision
           ? { playerId: game.pendingDecision.playerId, kind: game.pendingDecision.kind }
           : null,
+    suspendedWindowCount: Array.isArray(game.suspendedWindows)
+      ? game.suspendedWindows.length
+      : 0,
     showdown: game.showdown ? structuredClone(game.showdown) : null,
     combat: serialiseCombat(game.combat),
     battlefields: game.battlefields.map((field) => ({
@@ -589,7 +613,13 @@ function playCard(game, player, payload, catalog) {
       );
     }
   }
-  spendDeclaredResources(player, payload.spend ?? payload.declaredSpend);
+  payNormalCardCost(
+    game,
+    player,
+    card,
+    payload.spend ?? payload.declaredSpend,
+    catalog,
+  );
   source.splice(sourceIndex, 1);
 
   if (type === "spell") {
@@ -614,7 +644,7 @@ function playCard(game, player, payload, catalog) {
   } else {
     destinationField.cards.push(instance);
     if (destinationField.controllerPlayerId !== player.id) {
-      contestBattlefield(game, destinationField, player.id);
+      contestBattlefield(game, destinationField, player.id, player.id);
     }
   }
   record(
@@ -681,12 +711,57 @@ function standardMove(game, player, payload, catalog) {
     `${player.name} exhausted and moved ${located.length} Unit${located.length === 1 ? "" : "s"}.`,
   );
   if (destinationField && destinationField.controllerPlayerId !== player.id) {
-    contestBattlefield(game, destinationField, player.id);
+    contestBattlefield(game, destinationField, player.id, player.id);
   }
   runCleanup(game, catalog, { preserveContestedField: destinationField?.instanceId });
 }
 
-function contestBattlefield(game, battlefield, playerId) {
+function suspendCurrentWindow(game, actionPlayerId) {
+  if (!game.showdown) return;
+  if (!Array.isArray(game.suspendedWindows)) game.suspendedWindows = [];
+  const suspended = {
+    showdown: structuredClone(game.showdown),
+    combat: game.combat ? structuredClone(game.combat) : null,
+    turn: {
+      phase: game.turn.phase,
+      state: game.turn.state,
+      focusPlayerId: game.turn.focusPlayerId,
+    },
+  };
+  if (actionPlayerId && suspended.showdown.focusPlayerId === actionPlayerId) {
+    const next = opponentOf(game, actionPlayerId);
+    suspended.showdown.focusPlayerId = next.id;
+    suspended.showdown.consecutivePasses = 0;
+    suspended.turn.focusPlayerId = next.id;
+  }
+  game.suspendedWindows.push(suspended);
+}
+
+function resumeSuspendedWindow(game) {
+  if (
+    game.status !== "playing"
+    || game.showdown
+    || game.pendingDecision
+    || !Array.isArray(game.suspendedWindows)
+    || !game.suspendedWindows.length
+  ) return false;
+  const suspended = game.suspendedWindows.pop();
+  game.showdown = suspended.showdown;
+  game.combat = suspended.combat;
+  game.turn.phase = suspended.turn.phase;
+  game.turn.state = suspended.turn.state;
+  game.turn.focusPlayerId = suspended.turn.focusPlayerId;
+  record(
+    game,
+    "RESUME_RESPONSE_WINDOW",
+    "The previous response window resumed after a nested showdown resolved.",
+  );
+  return true;
+}
+
+function contestBattlefield(game, battlefield, playerId, actionPlayerId = playerId) {
+  suspendCurrentWindow(game, actionPlayerId);
+  game.combat = null;
   battlefield.contestedByPlayerId = playerId;
   const controllers = unitControllersAt(game, battlefield);
   const hasOpponent = controllers.some((id) => id !== playerId);
@@ -738,6 +813,26 @@ function closeShowdown(game, catalog) {
   const showdown = game.showdown;
   if (!showdown) return;
   const battlefield = getBattlefield(game, showdown.battlefieldId);
+  if (showdown.type === "triggered-effect") {
+    const pendingEffect = structuredClone(showdown.pendingEffect);
+    game.showdown = null;
+    game.combat = null;
+    game.turn.focusPlayerId = null;
+    game.turn.state = "neutral-open";
+    game.turn.phase = "main";
+    if (pendingEffect?.kind === "zaun-warrens-conquer") {
+      resolveZaunWarrensConquerEffect(
+        game,
+        getPlayer(game, pendingEffect.playerId),
+        battlefield,
+      );
+    } else {
+      fail("UNKNOWN_TRIGGERED_EFFECT", "The pending triggered effect is not supported.");
+    }
+    if (!game.pendingDecision) resumeSuspendedWindow(game);
+    runCleanup(game, catalog);
+    return;
+  }
   const controllers = unitControllersAt(game, battlefield);
   if (showdown.type === "combat" && controllers.length >= 2) {
     game.combat.stage = "assign-attacker";
@@ -767,6 +862,7 @@ function closeShowdown(game, catalog) {
   game.turn.phase = "main";
   if (controllers.length === 1) establishControl(game, battlefield, controllers[0], catalog);
   else if (!controllers.length) clearBattlefieldControl(game, battlefield);
+  resumeSuspendedWindow(game);
   runCleanup(game, catalog);
 }
 
@@ -867,6 +963,7 @@ function resolveCombat(game, catalog) {
   if (controllers.length === 1) establishControl(game, battlefield, controllers[0], catalog);
   else if (!controllers.length) clearBattlefieldControl(game, battlefield);
   record(game, "COMBAT_RESOLVED", "Combat damage resolved; surviving Units were healed and control was updated.");
+  resumeSuspendedWindow(game);
   runCleanup(game, catalog);
 }
 
@@ -911,7 +1008,149 @@ function scoreBattlefield(game, player, battlefield, method, catalog = null) {
       ? `${player.name} ${method === "hold" ? "Held" : "Conquered"} a battlefield and gained 1 point.`
       : `${player.name} Conquered but had not scored every battlefield this turn, so drew 1 instead of gaining the final point.`,
   );
+  if (method === "conquer") {
+    openZaunWarrensConquerTrigger(game, player, battlefield);
+  }
   if (catalog) runCleanup(game, catalog);
+}
+
+function openZaunWarrensConquerTrigger(game, player, battlefield) {
+  if (battlefield.cardId !== ZAUN_WARRENS_CARD_ID || game.status !== "playing") return;
+  game.showdown = {
+    battlefieldId: battlefield.instanceId,
+    type: "triggered-effect",
+    initiatorPlayerId: player.id,
+    focusPlayerId: player.id,
+    consecutivePasses: 0,
+    pendingEffect: {
+      kind: "zaun-warrens-conquer",
+      playerId: player.id,
+      sourceCardId: ZAUN_WARRENS_CARD_ID,
+    },
+  };
+  game.turn.phase = "showdown";
+  game.turn.state = "showdown-open";
+  game.turn.focusPlayerId = player.id;
+  record(
+    game,
+    "TRIGGERED_EFFECT",
+    `${player.name} placed Zaun Warrens' Conquer effect on the Chain; a response window opened.`,
+    { sourceCardId: ZAUN_WARRENS_CARD_ID, playerId: player.id },
+  );
+}
+
+function resolveZaunWarrensConquerEffect(game, player, battlefield) {
+  if (battlefield.cardId !== ZAUN_WARRENS_CARD_ID || game.status !== "playing") return;
+  const eligibleInstanceIds = player.zones.hand.map((card) => card.instanceId);
+  if (eligibleInstanceIds.length <= 1) {
+    completeZaunWarrensEffect(game, player, eligibleInstanceIds[0] || null);
+    return;
+  }
+
+  game.pendingDecision = {
+    id: crypto.randomUUID(),
+    kind: "card-selection",
+    playerId: player.id,
+    source: {
+      cardId: ZAUN_WARRENS_CARD_ID,
+      battlefieldId: battlefield.instanceId,
+      trigger: "conquer",
+    },
+    prompt: "Zaun Warrens — discard 1, then draw 1.",
+    selection: {
+      operation: "discard",
+      ownerPlayerId: player.id,
+      zones: ["hand"],
+      count: 1,
+      fulfillment: "as-many-as-possible",
+      eligibleInstanceIds,
+    },
+    continuation: [{ operation: "draw", playerId: player.id, count: 1 }],
+  };
+  record(
+    game,
+    "CARD_CHOICE",
+    `${player.name} must choose a card to discard for Zaun Warrens.`,
+    { sourceCardId: ZAUN_WARRENS_CARD_ID, playerId: player.id },
+  );
+}
+
+function resolvePendingDecision(game, player, payload, catalog) {
+  assertPlaying(game);
+  const decision = game.pendingDecision;
+  if (!decision) {
+    fail("NO_PENDING_DECISION", "There is no pending card choice to resolve.");
+  }
+  if (decision.playerId !== player.id) {
+    fail("NOT_YOUR_PENDING_DECISION", "The other player must resolve this card choice.");
+  }
+  const decisionId = String(payload.decisionId || "");
+  if (!decisionId || decisionId !== decision.id) {
+    fail("STALE_PENDING_DECISION", "That card choice is no longer current.");
+  }
+  if (
+    decision.kind !== "card-selection" ||
+    decision.source?.cardId !== ZAUN_WARRENS_CARD_ID ||
+    decision.selection?.operation !== "discard"
+  ) {
+    fail("UNKNOWN_PENDING_DECISION", "This pending card choice is not supported.");
+  }
+
+  const instanceIds = Array.isArray(payload.instanceIds)
+    ? payload.instanceIds.map(String)
+    : [String(payload.instanceId || "")].filter(Boolean);
+  const requiredCount = Number(decision.selection.count) || 0;
+  if (instanceIds.length !== requiredCount || new Set(instanceIds).size !== instanceIds.length) {
+    fail(
+      "INVALID_PENDING_SELECTION",
+      `Choose exactly ${requiredCount} card${requiredCount === 1 ? "" : "s"}.`,
+    );
+  }
+  const eligible = new Set(decision.selection.eligibleInstanceIds || []);
+  const selectedId = instanceIds[0];
+  const selected = player.zones.hand.find((card) => card.instanceId === selectedId);
+  if (!selected || !eligible.has(selectedId)) {
+    fail("INVALID_PENDING_SELECTION", "Choose an eligible card from your current hand.");
+  }
+
+  game.pendingDecision = null;
+  completeZaunWarrensEffect(game, player, selectedId);
+  resumeSuspendedWindow(game);
+  runCleanup(game, catalog);
+}
+
+function completeZaunWarrensEffect(game, player, discardedInstanceId) {
+  let discardedCardId = null;
+  if (discardedInstanceId) {
+    const selected = player.zones.hand.find(
+      (card) => card.instanceId === discardedInstanceId,
+    );
+    if (!selected) {
+      fail("INVALID_PENDING_SELECTION", "The selected discard is no longer in your hand.");
+    }
+    discardedCardId = selected.cardId;
+    moveCardToTrash(game, discardedInstanceId);
+    record(
+      game,
+      "DISCARD",
+      `${player.name} discarded 1 card for Zaun Warrens.`,
+      {
+        sourceCardId: ZAUN_WARRENS_CARD_ID,
+        discardedInstanceId,
+        discardedCardId,
+      },
+    );
+  }
+  drawCards(game, player, 1, "Zaun Warrens");
+  record(
+    game,
+    "CARD_EFFECT",
+    `${player.name} resolved Zaun Warrens${discardedCardId ? " by discarding 1 and drawing 1" : " and drew 1 with an empty hand"}.`,
+    {
+      sourceCardId: ZAUN_WARRENS_CARD_ID,
+      discarded: Boolean(discardedCardId),
+    },
+  );
 }
 
 function applyManualEffect(game, player, payload, catalog) {
@@ -976,7 +1215,7 @@ function applyManualOperation(game, actingPlayer, operation, catalog) {
       recallPermanent(game, operation.instanceId, catalog);
       return;
     case "MOVE":
-      effectMove(game, operation, catalog);
+      effectMove(game, operation, catalog, actingPlayer.id);
       return;
     case "DAMAGE": {
       const location = requirePublicBoardLocation(game, operation.instanceId);
@@ -1114,7 +1353,7 @@ function isOfficialTokenRecord(card) {
   return originToken || tokenVariant;
 }
 
-function effectMove(game, operation, catalog) {
+function effectMove(game, operation, catalog, actionPlayerId) {
   const location = locateInstance(game, String(operation.instanceId || ""));
   if (!location || !new Set(["base", "battlefield"]).has(location.zone)) {
     fail("INVALID_EFFECT_MOVE", "A printed move effect can move only a Unit on the board.");
@@ -1133,7 +1372,7 @@ function effectMove(game, operation, catalog) {
   removeLocated(location);
   battlefield.cards.push(location.card);
   if (battlefield.controllerPlayerId !== controller.id) {
-    contestBattlefield(game, battlefield, controller.id);
+    contestBattlefield(game, battlefield, controller.id, actionPlayerId);
   }
 }
 
@@ -1218,26 +1457,117 @@ function channelRunes(game, player, count, exhausted) {
   record(game, "CHANNEL", `${player.name} channeled ${actual} rune${actual === 1 ? "" : "s"}.`);
 }
 
-function spendDeclaredResources(player, rawSpend) {
-  if (rawSpend === undefined || rawSpend === null) return;
-  const spend = asObject(rawSpend);
-  const energy = toInteger(spend.energy ?? 0, 0, 999, "Energy spend");
-  if (player.runePool.energy < energy) fail("INSUFFICIENT_ENERGY", "Not enough Energy is in your Rune Pool.");
-  const power = asObject(spend.powerByDomain ?? spend.power);
-  for (const [domain, rawAmount] of Object.entries(power)) {
-    const amount = toInteger(rawAmount, 0, 999, "Power spend");
-    if ((player.runePool.powerByDomain[domain] || 0) < amount) {
-      fail("INSUFFICIENT_POWER", `Not enough ${domain} Power is in your Rune Pool.`);
+function payNormalCardCost(game, player, card, rawDeclaredCost, catalog) {
+  const plan = planRunePayment({
+    card,
+    runePool: player.runePool,
+    runes: player.zones.runes,
+    cardsById: catalog,
+  });
+
+  if (rawDeclaredCost !== undefined && rawDeclaredCost !== null) {
+    const declared = planRunePayment({ cost: rawDeclaredCost }).cost;
+    if (!sameResourceCost(declared, plan.cost)) {
+      fail(
+        "DECLARED_COST_MISMATCH",
+        "The client-declared cost does not match this card. Refresh the match and try again.",
+        { expected: plan.cost, declared },
+      );
     }
   }
-  player.runePool.energy -= energy;
-  for (const [domain, rawAmount] of Object.entries(power)) {
-    player.runePool.powerByDomain[domain] -= Number(rawAmount);
+
+  if (!plan.affordable) {
+    fail(
+      "INSUFFICIENT_CARD_RESOURCES",
+      plan.summaries.shortage || `You cannot pay ${plan.summaries.cost}.`,
+      { cost: plan.cost, shortages: plan.shortages },
+    );
   }
+
+  for (const instanceId of plan.exhaustIds) {
+    const rune = player.zones.runes.find((candidate) => candidate.instanceId === instanceId);
+    if (!rune || rune.exhausted) {
+      fail("RUNE_PAYMENT_CHANGED", "The planned Rune payment is no longer available.");
+    }
+    rune.exhausted = true;
+    player.runePool.energy += 1;
+  }
+
+  for (const instanceId of plan.recycleIds) {
+    const index = player.zones.runes.findIndex((candidate) => candidate.instanceId === instanceId);
+    if (index < 0) fail("RUNE_PAYMENT_CHANGED", "The planned Rune payment is no longer available.");
+    const [rune] = player.zones.runes.splice(index, 1);
+    const domain = runeDomain(requireCatalogCard(catalog, rune.cardId, "Rune"));
+    player.runePool.powerByDomain[domain] =
+      (player.runePool.powerByDomain[domain] || 0) + 1;
+    resetForNonBoardZone(rune);
+    player.zones.runeDeck.unshift(rune);
+  }
+
+  player.runePool.energy -= plan.cost.energy;
+  for (const domain of RUNE_DOMAINS) {
+    const amount = plan.cost.powerByDomain[domain] || 0;
+    if (!amount) continue;
+    player.runePool.powerByDomain[domain] -= amount;
+  }
+
+  const totalPower = Object.values(plan.cost.powerByDomain).reduce(
+    (total, amount) => total + amount,
+    0,
+  );
+  if (plan.cost.energy || totalPower) {
+    const poolParts = [
+      plan.fromPool.energy ? `${plan.fromPool.energy} Energy` : "",
+      ...Object.entries(plan.fromPool.powerByDomain)
+        .filter(([, amount]) => amount > 0)
+        .map(([domain, amount]) => `${amount} ${domain[0].toUpperCase()}${domain.slice(1)} Power`),
+    ].filter(Boolean);
+    const activatedRunes = plan.exhaustIds.length || plan.recycleIds.length;
+    const paymentSteps = [
+      poolParts.length ? `used ${poolParts.join(" + ")} already in the Rune Pool` : "",
+      activatedRunes ? plan.summaries.payment : "",
+    ].filter(Boolean).join("; ");
+    record(
+      game,
+      "PAY_COST",
+      `${player.name} paid ${plan.summaries.cost} for ${card.name || "a card"}: ${paymentSteps}.`,
+      {
+        cardId: card.id,
+        cost: plan.cost,
+        fromPool: plan.fromPool,
+        exhaustedRuneIds: plan.exhaustIds,
+        recycledRuneIds: plan.recycleIds,
+      },
+    );
+  }
+}
+
+function sameResourceCost(left, right) {
+  if (left.energy !== right.energy) return false;
+  const domains = new Set([
+    ...RUNE_DOMAINS,
+    ...Object.keys(left.unsupportedPowerByDomain || {}),
+    ...Object.keys(right.unsupportedPowerByDomain || {}),
+  ]);
+  for (const domain of domains) {
+    const leftAmount = left.powerByDomain[domain]
+      || left.unsupportedPowerByDomain[domain]
+      || 0;
+    const rightAmount = right.powerByDomain[domain]
+      || right.unsupportedPowerByDomain[domain]
+      || 0;
+    if (leftAmount !== rightAmount) return false;
+  }
+  return true;
 }
 
 function runCleanup(game, catalog, { preserveContestedField = null } = {}) {
   if (game.status !== "playing") return;
+  if (
+    game.pendingDecision
+    || game.showdown?.type === "triggered-effect"
+    || game.suspendedWindows?.length
+  ) return;
   checkVictory(game);
   if (game.status === "finished") return;
   if (catalog) killLethalUnits(game, catalog);
@@ -1277,6 +1607,8 @@ function finishGame(game, winnerPlayerId, reason, message) {
   game.status = "finished";
   game.winnerPlayerId = winnerPlayerId;
   game.result = { winnerPlayerId, reason };
+  game.pendingDecision = null;
+  game.suspendedWindows = [];
   game.turn.phase = "finished";
   game.turn.state = "neutral-open";
   game.turn.priorityPlayerId = null;
