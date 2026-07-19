@@ -1,0 +1,6 @@
+node_modules
+dist
+release
+desktop-smoke.png
+.env
+npm-debug.log*
